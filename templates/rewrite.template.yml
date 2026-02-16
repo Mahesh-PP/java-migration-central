@@ -1,0 +1,61 @@
+type: specs.openrewrite.org/v1beta/recipe
+name: io.github.migration.JavaMigration
+displayName: Centralized Java Migration Recipe
+description: Automated Java version migration with code transformation
+
+recipeList:
+  # Java 8 to 11 migrations
+  - org.openrewrite.java.migrate.Java8to11
+  - org.openrewrite.java.RemoveJavaIoSerializable
+  - org.openrewrite.java.migrate.RemoveUnnecessaryBoxingInMethodCalls
+  - org.openrewrite.java.migrate.lang.JavaLangClassNewInstanceToGetDeclaredConstructor
+
+  # Java 11 to 17 migrations
+  - org.openrewrite.java.migrate.Java11to17
+  - org.openrewrite.java.migrate.RemoveUnnecessaryExtendsObject
+  - org.openrewrite.java.RemoveUnnecessaryPackageQualifiedStaticAccess
+
+  # Java 17 to 21 migrations
+  - org.openrewrite.java.migrate.Java17to21
+  - org.openrewrite.java.migrate.UpgradeToJava21
+
+  # Java 21 to 25 migrations
+  - org.openrewrite.java.migrate.Java21to25
+  - org.openrewrite.java.migrate.UpgradeToJava25
+
+  # Common transformations
+  - org.openrewrite.java.format.RemoveTrailingWhitespace
+  - org.openrewrite.java.format.NormalizeLineEndings
+  - org.openrewrite.java.ChangeMethodAccessorToProperty
+  - org.openrewrite.java.UpgradeJavaVersion
+
+  # Deprecated API removals
+  - org.openrewrite.java.migrate.RemoveDeprecatedMethods
+
+  # Import optimizations
+  - org.openrewrite.java.RemoveUnusedImports
+  - org.openrewrite.java.OrganizeImports
+
+---
+type: specs.openrewrite.org/v1beta/recipe
+name: io.github.migration.RemoveDeprecatedApis
+displayName: Remove Deprecated APIs
+description: Removes deprecated method calls and classes
+
+recipeList:
+  - org.openrewrite.java.migrate.RemoveDeprecatedMethods
+  - org.openrewrite.java.migrate.ReplaceThreadRunWithThreadStart
+  - org.openrewrite.java.migrate.ReplaceRuntimeExecWithProcessBuilder
+
+---
+type: specs.openrewrite.org/v1beta/recipe
+name: io.github.migration.ModernizeCode
+displayName: Modernize Java Code
+description: Use modern Java features (records, text blocks, sealed classes)
+
+recipeList:
+  - org.openrewrite.java.migrate.UpgradeJavaVersion
+  - org.openrewrite.java.RecordVariableUsage
+  - org.openrewrite.java.UseTextBlocks
+  - org.openrewrite.java.migrate.RemoveUnnecessaryBoxing
+
