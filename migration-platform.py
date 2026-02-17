@@ -27,6 +27,8 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import concurrent.futures
 import requests
+import shutil
+from urllib.parse import urlparse
 
 # Setup logging
 logging.basicConfig(
@@ -489,6 +491,259 @@ jobs:
 
         print("\n" + "="*70 + "\n")
 
+    def migrate_repositories(self, urls: List[str], source: str = '8', target: str = '11', workers: int = 4, push: bool = False, branch: str = None, create_pr: bool = False) -> List[Dict]:
+        """Migrate one or more repositories from source -> target.
+
+        Steps performed (best-effort demo):
+        - clone the repo
+        - detect build system
+        - create OpenRewrite recipe, Renovate config, GitHub Actions workflow
+        - create a migration branch, commit the new configs
+        - optionally push the branch (requires auth)
+
+        This function is intentionally conservative: it doesn't modify source code
+        or run OpenRewrite automatically. It prepares repository-level configs
+        and commits them on a branch so maintainers can review and run migration
+        pipelines.
+        """
+        results = []
+        work_dir = self.config_dir / 'work'
+        work_dir.mkdir(exist_ok=True)
+        branch = branch or f'migrate-java-{source}-to-{target}'
+
+        def process(url: str) -> Dict:
+            repo_name = url.split('/')[-1].replace('.git', '')
+            repo_path = work_dir / repo_name
+            result = {
+                'repo': repo_name,
+                'url': url,
+                'status': 'FAILED',
+                'message': ''
+            }
+
+            # Ensure previous work removed
+            if repo_path.exists():
+                try:
+                    shutil.rmtree(repo_path)
+                except Exception:
+                    pass
+
+            try:
+                logger.info(f"Cloning {url} → {repo_path}")
+                subprocess.run(['git', 'clone', url, str(repo_path)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                # Detect build system by files
+                build_system = 'maven'
+                if (repo_path / 'pom.xml').exists():
+                    build_system = 'maven'
+                elif (repo_path / 'build.gradle').exists() or (repo_path / 'build.gradle.kts').exists():
+                    build_system = 'gradle'
+
+                # Register repository (saves a config JSON)
+                self.register_repository(url, source, target)
+                config_file = self.repos_dir / f"{repo_name}.json"
+                # Load config and update build_system
+                try:
+                    with open(config_file, 'r') as f:
+                        cfg = json.load(f)
+                    cfg['build_system'] = build_system
+                    cfg['status'] = MigrationStatus.IN_PROGRESS.value
+                    cfg['last_updated'] = datetime.now().isoformat()
+                    with open(config_file, 'w') as f:
+                        json.dump(cfg, f, indent=2)
+                except Exception:
+                    logger.debug(f"Could not update local repo config for {repo_name}")
+
+                # Create OpenRewrite recipe
+                or_cfg = self.create_openrewrite_config(source, target)
+                or_dir = repo_path / '.openrewrite'
+                or_dir.mkdir(parents=True, exist_ok=True)
+                with open(or_dir / 'recipe.yml', 'w') as f:
+                    yaml.dump(or_cfg, f)
+
+                # Create renovate.json
+                repo_config = RepositoryConfig(repo_url=url, repo_name=repo_name, current_java_version=source, target_java_version=target, build_system=build_system)
+                renovate_cfg = self.create_renovate_config(repo_config)
+                with open(repo_path / 'renovate.json', 'w') as f:
+                    json.dump(renovate_cfg, f, indent=2)
+
+                # Create GitHub Actions workflow
+                gha = self.create_github_actions_config(repo_config)
+                gha_dir = repo_path / '.github' / 'workflows'
+                gha_dir.mkdir(parents=True, exist_ok=True)
+                with open(gha_dir / 'java-migration.yml', 'w') as f:
+                    f.write(gha)
+
+                # Git: create branch, commit
+                subprocess.run(['git', '-C', str(repo_path), 'checkout', '-b', branch], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                subprocess.run(['git', '-C', str(repo_path), 'add', '.'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                commit_msg = f'chore(migration): add migration configs for Java {source} → {target}'
+                # Allow commit to succeed even if no changes
+                subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                if push:
+                    logger.info(f"Pushing branch {branch} to origin for {repo_name} (requires auth)")
+                    try:
+                        subprocess.run(['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch], check=True)
+                        pushed = True
+                    except subprocess.CalledProcessError as e:
+                        logger.warning(f"Push failed for {repo_name}: {e}")
+                        pushed = False
+                else:
+                    pushed = False
+
+                # Optionally create a PR (only if push succeeded and create_pr requested)
+                if create_pr and pushed:
+                    try:
+                        pr_url = self.create_pull_request(repo_path, branch,
+                                                          title=f"Migrate to Java {target}",
+                                                          body=f"Automated migration branch to upgrade from Java {source} to {target}.")
+                        result['message'] += f'; PR: {pr_url}' if pr_url else '; PR not created'
+                    except Exception as e:
+                        logger.warning(f"PR creation failed for {repo_name}: {e}")
+
+                # Update stored config to completed
+                try:
+                    with open(config_file, 'r') as f:
+                        cfg = json.load(f)
+                    cfg['status'] = MigrationStatus.COMPLETED.value
+                    cfg['last_updated'] = datetime.now().isoformat()
+                    with open(config_file, 'w') as f:
+                        json.dump(cfg, f, indent=2)
+                except Exception:
+                    pass
+
+                result['status'] = 'COMPLETED'
+                result['message'] = f'Prepared migration branch {branch}'
+                logger.info(f"Prepared migration for {repo_name}")
+            except subprocess.CalledProcessError as e:
+                errmsg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
+                result['message'] = f'Git error: {errmsg}'
+                logger.error(f"Git operation failed for {repo_name}: {errmsg}")
+                # mark failed
+                try:
+                    config_file = self.repos_dir / f"{repo_name}.json"
+                    if config_file.exists():
+                        with open(config_file, 'r') as f:
+                            cfg = json.load(f)
+                        cfg['status'] = MigrationStatus.FAILED.value
+                        cfg['error_message'] = errmsg
+                        cfg['last_updated'] = datetime.now().isoformat()
+                        with open(config_file, 'w') as f:
+                            json.dump(cfg, f, indent=2)
+                except Exception:
+                    pass
+            except Exception as e:
+                result['message'] = str(e)
+                logger.error(f"Error preparing {repo_name}: {e}")
+                try:
+                    config_file = self.repos_dir / f"{repo_name}.json"
+                    if config_file.exists():
+                        with open(config_file, 'r') as f:
+                            cfg = json.load(f)
+                        cfg['status'] = MigrationStatus.FAILED.value
+                        cfg['error_message'] = str(e)
+                        cfg['last_updated'] = datetime.now().isoformat()
+                        with open(config_file, 'w') as f:
+                            json.dump(cfg, f, indent=2)
+                except Exception:
+                    pass
+
+            return result
+
+        # Run in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(process, url): url for url in urls}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    res = fut.result()
+                    results.append(res)
+                except Exception as e:
+                    results.append({'repo': 'unknown', 'url': futures[fut], 'status': 'FAILED', 'message': str(e)})
+
+        return results
+
+    def create_pull_request(self, repo_path: Path, branch: str, title: str, body: str) -> Optional[str]:
+        """Create a GitHub Pull Request for the pushed branch.
+
+        Conditions and safety:
+        - The remote 'origin' must point to a GitHub repository (github.com in URL).
+        - A GITHUB_TOKEN environment variable must be present.
+        - The branch must already be pushed to origin.
+
+        Returns the PR URL on success or None on skip/failure.
+        """
+        try:
+            # Get origin URL
+            proc = subprocess.run(['git', '-C', str(repo_path), 'config', '--get', 'remote.origin.url'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            origin_url = proc.stdout.decode().strip()
+            if 'github.com' not in origin_url:
+                logger.info(f"Origin is not GitHub for {repo_path}, skipping PR creation: {origin_url}")
+                return None
+
+            # Parse owner and repo
+            owner = None
+            repo = None
+            if origin_url.startswith('git@'):
+                # git@github.com:owner/repo.git
+                parts = origin_url.split(':', 1)
+                if len(parts) == 2:
+                    owner_repo = parts[1]
+                    if owner_repo.endswith('.git'):
+                        owner_repo = owner_repo[:-4]
+                    if '/' in owner_repo:
+                        owner, repo = owner_repo.split('/', 1)
+            else:
+                # https://github.com/owner/repo.git
+                parsed = urlparse(origin_url)
+                path = parsed.path.lstrip('/')
+                if path.endswith('.git'):
+                    path = path[:-4]
+                if '/' in path:
+                    owner, repo = path.split('/', 1)
+
+            if not owner or not repo:
+                logger.info(f"Could not parse GitHub owner/repo from origin: {origin_url}")
+                return None
+
+            token = os.environ.get('GITHUB_TOKEN')
+            if not token:
+                logger.info('GITHUB_TOKEN not set; skipping PR creation')
+                return None
+
+            api_base = f'https://api.github.com/repos/{owner}/{repo}'
+
+            # Get default branch for base
+            headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
+            r = requests.get(api_base, headers=headers, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"Failed to fetch repo info from GitHub: {r.status_code} {r.text}")
+                return None
+            repo_info = r.json()
+            base_branch = repo_info.get('default_branch', 'main')
+
+            # Create PR
+            pr_payload = {
+                'title': title,
+                'head': branch,
+                'base': base_branch,
+                'body': body
+            }
+            pr_r = requests.post(f'{api_base}/pulls', headers=headers, json=pr_payload, timeout=15)
+            if pr_r.status_code in (200, 201):
+                pr = pr_r.json()
+                pr_url = pr.get('html_url')
+                logger.info(f"Created PR: {pr_url}")
+                return pr_url
+            else:
+                logger.warning(f"Failed to create PR: {pr_r.status_code} {pr_r.text}")
+                return None
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Git error while determining origin for PR creation: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error creating PR: {e}")
+            return None
 
 def main():
     """Main CLI interface"""
@@ -516,6 +771,17 @@ def main():
     templates_parser = subparsers.add_parser('create-templates',
                                             help='Create migration templates')
 
+    # Migrate command - accepts multiple --url or a --csv file
+    migrate_parser = subparsers.add_parser('migrate', help='Prepare migration for one or more repositories')
+    migrate_parser.add_argument('--url', action='append', help='Repository URL (can be specified multiple times)')
+    migrate_parser.add_argument('--csv', help='CSV file with repository URLs (one per line)')
+    migrate_parser.add_argument('--source', default='8', help='Source Java version (default: 8)')
+    migrate_parser.add_argument('--target', default='11', help='Target Java version (default: 11)')
+    migrate_parser.add_argument('--workers', type=int, default=4, help='Parallel workers (default: 4)')
+    migrate_parser.add_argument('--push', action='store_true', help='Push migration branch to origin (requires auth)')
+    migrate_parser.add_argument('--branch', help='Branch name to create for migration (default generated)')
+    migrate_parser.add_argument('--create-pr', action='store_true', help='Create a GitHub PR for the migration branch')
+
     args = parser.parse_args()
 
     platform = JavaMigrationPlatform(args.config_dir)
@@ -536,10 +802,32 @@ def main():
     elif args.command == 'create-templates':
         platform.create_migration_templates()
 
+    elif args.command == 'migrate':
+        urls = []
+        if args.url:
+            urls.extend(args.url)
+        if args.csv:
+            csv_path = Path(args.csv)
+            if csv_path.exists():
+                with open(csv_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            urls.append(line)
+            else:
+                logger.error(f"CSV file not found: {csv_path}")
+                sys.exit(2)
+
+        if not urls:
+            logger.error('No repository URLs provided. Use --url or --csv')
+            sys.exit(2)
+
+        results = platform.migrate_repositories(urls, source=args.source, target=args.target, workers=args.workers, push=args.push, branch=args.branch, create_pr=args.create_pr)
+        print(json.dumps(results, indent=2))
+
     else:
         parser.print_help()
 
 
 if __name__ == '__main__':
     main()
-
