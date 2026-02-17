@@ -25,8 +25,8 @@ on:
           - '17'
           - '21'
       github_token:
-        description: 'GitHub Personal Access Token (PAT) for authentication'
-        required: true
+        description: 'GitHub Personal Access Token (PAT) - OPTIONAL for testing, REQUIRED for PR creation'
+        required: false
         type: string
 
 jobs:
@@ -47,6 +47,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate PAT requirement (optional message)
+        run: |
+          if [ -z "${{ github.event.inputs.github_token }}" ]; then
+            echo "⚠️  No PAT provided - running in TEST mode"
+            echo "✅ Migration analysis will run, but PR creation will be skipped"
+            echo "🔑 To enable PR creation, provide a GitHub PAT token"
+          else
+            echo "✅ PAT provided - full workflow will execute"
+          fi
+
       - name: Run Java migration
         env:
           TARGET_REPO_URL: ${{ github.event.inputs.repo_url }}
@@ -54,11 +64,18 @@ jobs:
           TARGET_JAVA_VERSION: ${{ github.event.inputs.target_java_version }}
           GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
-          python migration-platform.py \
-            --repo-url "$TARGET_REPO_URL" \
-            --source-version "$SOURCE_JAVA_VERSION" \
-            --target-version "$TARGET_JAVA_VERSION" \
-            --github-token "$GITHUB_TOKEN"
+          if [ -z "$GITHUB_TOKEN" ]; then
+            python migration-platform.py \
+              --repo-url "$TARGET_REPO_URL" \
+              --source-version "$SOURCE_JAVA_VERSION" \
+              --target-version "$TARGET_JAVA_VERSION"
+          else
+            python migration-platform.py \
+              --repo-url "$TARGET_REPO_URL" \
+              --source-version "$SOURCE_JAVA_VERSION" \
+              --target-version "$TARGET_JAVA_VERSION" \
+              --github-token "$GITHUB_TOKEN"
+          fi
 
       - name: Upload migration report
         if: always()
@@ -69,10 +86,9 @@ jobs:
           retention-days: 30
 
       - name: Create Pull Request
-        if: success()
+        if: success() && github.event.inputs.github_token != ''
         env:
           GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
-          echo "Migration completed successfully!"
-          echo "Check the target repository for the PR: ${{ github.event.inputs.repo_url }}"
-
+          echo "🎉 Migration completed successfully!"
+          echo "📝 Check the target repository for the PR: ${{ github.event.inputs.repo_url }}"
