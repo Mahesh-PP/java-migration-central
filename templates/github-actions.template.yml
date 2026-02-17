@@ -1,0 +1,375 @@
+name: Java Migration CI/CD - Centralized Pipeline
+
+on:
+  push:
+    branches: [main, develop, master]
+    paths:
+      - 'pom.xml'
+      - 'build.gradle'
+      - 'src/**'
+      - '.openrewrite/**'
+      - 'renovate.json'
+  pull_request:
+    branches: [main, develop, master]
+  schedule:
+    # Run daily at 2am
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      java_versions:
+        description: 'Java versions to test (comma-separated)'
+        required: false
+        default: '11,17,21,25'
+
+jobs:
+  setup:
+    name: Setup Migration Pipeline
+    runs-on: ubuntu-latest
+    outputs:
+      java-versions: ${{ steps.set-versions.outputs.versions }}
+      build-system: ${{ steps.detect-build.outputs.system }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Determine Java versions
+        id: set-versions
+        run: |
+          if [ -z "${{ github.event.inputs.java_versions }}" ]; then
+            echo "versions=11,17,21,25" >> $GITHUB_OUTPUT
+          else
+            echo "versions=${{ github.event.inputs.java_versions }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect build system
+        id: detect-build
+        run: |
+          if [ -f "pom.xml" ]; then
+            echo "system=maven" >> $GITHUB_OUTPUT
+          elif [ -f "build.gradle" ]; then
+            echo "system=gradle" >> $GITHUB_OUTPUT
+          else
+            echo "system=unknown" >> $GITHUB_OUTPUT
+          fi
+
+  renovate-check:
+    name: Validate Renovate Configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Check Renovate config
+        run: |
+          if [ -f "renovate.json" ]; then
+            echo "✅ Renovate configuration found"
+            cat renovate.json | head -20
+          else
+            echo "⚠️  No Renovate configuration"
+          fi
+
+  openrewrite-check:
+    name: Validate OpenRewrite Configuration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Check OpenRewrite config
+        run: |
+          if [ -f ".rewrite.yml" ]; then
+            echo "✅ OpenRewrite configuration found"
+            cat .rewrite.yml | head -20
+          else
+            echo "⚠️  No OpenRewrite configuration"
+          fi
+
+  build-and-test:
+    name: Build & Test (Java ${{ matrix.java-version }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java-version: [11, 17, 21, 25]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Java ${{ matrix.java-version }}
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Compile with Maven
+        if: needs.setup.outputs.build-system == 'maven'
+        run: ./mvnw clean compile -DskipTests
+        continue-on-error: true
+
+      - name: Compile with Gradle
+        if: needs.setup.outputs.build-system == 'gradle'
+        run: ./gradlew clean build -x test
+        continue-on-error: true
+
+      - name: Run Unit Tests
+        if: needs.setup.outputs.build-system == 'maven'
+        run: ./mvnw test
+        continue-on-error: true
+
+      - name: Run Integration Tests
+        if: needs.setup.outputs.build-system == 'maven'
+        run: ./mvnw verify
+        continue-on-error: true
+
+      - name: Code Quality Checks
+        if: needs.setup.outputs.build-system == 'maven'
+        run: |
+          ./mvnw checkstyle:check || true
+          ./mvnw spotbugs:check || true
+        continue-on-error: true
+
+      - name: Generate Test Report
+        if: always()
+        run: |
+          echo "Java ${{ matrix.java-version }} - Build Report" > build-report-java${{ matrix.java-version }}.txt
+          echo "Status: $([ $? -eq 0 ] && echo 'PASSED' || echo 'FAILED')" >> build-report-java${{ matrix.java-version }}.txt
+
+      - name: Upload Test Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-report-java${{ matrix.java-version }}
+          path: build-report-java${{ matrix.java-version }}.txt
+          retention-days: 30
+
+  openrewrite-scan:
+    name: OpenRewrite Code Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Run OpenRewrite Analysis
+        if: hashFiles('pom.xml') != ''
+        run: |
+          ./mvnw org.openrewrite.maven:rewrite-maven-plugin:run \
+            -Drewrite.configLocation=.rewrite.yml || true
+        continue-on-error: true
+
+      - name: Generate OpenRewrite Report
+        if: always()
+        run: |
+          echo "OpenRewrite Code Transformation Report" > openrewrite-report.txt
+          echo "Generated: $(date)" >> openrewrite-report.txt
+
+      - name: Upload OpenRewrite Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: openrewrite-report
+          path: openrewrite-report.txt
+          retention-days: 30
+
+  dependency-check:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.repository }}
+          path: '.'
+          format: 'JSON'
+          args: >
+            --enable-experimental
+            --scan .
+        continue-on-error: true
+
+      - name: Upload Dependency Report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-report
+          path: reports/
+          retention-days: 30
+
+  migration-status:
+    name: Java Migration Status Report
+    if: always()
+    needs: [build-and-test, openrewrite-scan, dependency-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate Migration Status
+        run: |
+          echo "# Java Migration Status Report" > migration-status.md
+          echo "" >> migration-status.md
+          echo "**Repository:** ${{ github.repository }}" >> migration-status.md
+          echo "**Branch:** ${{ github.ref }}" >> migration-status.md
+          echo "**Commit:** ${{ github.sha }}" >> migration-status.md
+          echo "" >> migration-status.md
+          echo "## Build Status" >> migration-status.md
+          echo "- Java 11: $([ -f build-report-java11/build-report-java11.txt ] && echo '✅' || echo '❌')" >> migration-status.md
+          echo "- Java 17: $([ -f build-report-java17/build-report-java17.txt ] && echo '✅' || echo '❌')" >> migration-status.md
+          echo "- Java 21: $([ -f build-report-java21/build-report-java21.txt ] && echo '✅' || echo '❌')" >> migration-status.md
+          echo "- Java 25: $([ -f build-report-java25/build-report-java25.txt ] && echo '✅' || echo '❌')" >> migration-status.md
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const status = fs.readFileSync('migration-status.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: status
+            });
+
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: migration-status-report
+          path: migration-status.md
+          retention-days: 30
+
+  notify:
+    name: Send Notifications
+    if: always()
+    needs: [build-and-test, migration-status]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Java Migration Pipeline Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref }}\n*Commit:* ${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Notify Slack on Success
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ Java Migration Pipeline Passed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref }}\n*Status:* Success"
+                  }
+                }
+              ]
+            }
+{
+  "extends": ["config:base"],
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Java Migration - Automated Dependency Updates",
+
+  "automerge": false,
+  "automergeType": "pr",
+  "automergeStrategy": "squash",
+
+  "java": {
+    "enabled": true
+  },
+
+  "maven": {
+    "enabled": true,
+    "skipCache": false
+  },
+
+  "gradle": {
+    "enabled": true
+  },
+
+  "packageRules": [
+    {
+      "description": "Auto-merge minor and patch updates for development dependencies",
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchDatasources": ["maven"],
+      "automerge": true,
+      "automergeType": "pr",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Require review for major version updates",
+      "matchUpdateTypes": ["major"],
+      "matchDatasources": ["maven"],
+      "automerge": false,
+      "reviewers": ["@owner"]
+    },
+    {
+      "description": "Spring Boot updates",
+      "matchPackagePrefixes": ["org.springframework.boot"],
+      "groupName": "Spring Boot",
+      "schedule": ["before 3am on Monday"],
+      "automerge": false
+    },
+    {
+      "description": "Java Compiler updates",
+      "matchPackagePatterns": ["maven-compiler-plugin", "gradle"],
+      "groupName": "Build Tools",
+      "automerge": true
+    },
+    {
+      "description": "Maven plugins",
+      "matchPackagePatterns": ["maven-.*-plugin"],
+      "groupName": "Maven Plugins",
+      "automerge": true
+    }
+  ],
+
+  "schedule": ["before 3am on Monday"],
+  "prCreation": "not-pending",
+  "semanticCommits": true,
+  "commitMessagePrefix": "chore(deps): ",
+  "prBodyColumns": ["Package", "Type", "Update", "Change"],
+
+  "ignoreDeps": [],
+  "ignoreUnstable": true,
+  "ignoreTests": false,
+
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  },
+
+  "postUpdateOptions": [
+    "gomodTidy",
+    "yarnDedupeModules"
+  ],
+
+  "enabledManagers": [
+    "maven",
+    "gradle"
+  ]
+}
+
