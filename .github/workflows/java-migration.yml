@@ -65,16 +65,17 @@ jobs:
           GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
           if [ -z "$GITHUB_TOKEN" ]; then
-            python migration-platform.py \
-              --repo-url "$TARGET_REPO_URL" \
-              --source-version "$SOURCE_JAVA_VERSION" \
-              --target-version "$TARGET_JAVA_VERSION"
+            python3 migration-platform.py migrate \
+              --url "$TARGET_REPO_URL" \
+              --source "$SOURCE_JAVA_VERSION" \
+              --target "$TARGET_JAVA_VERSION"
           else
-            python migration-platform.py \
-              --repo-url "$TARGET_REPO_URL" \
-              --source-version "$SOURCE_JAVA_VERSION" \
-              --target-version "$TARGET_JAVA_VERSION" \
-              --github-token "$GITHUB_TOKEN"
+            python3 migration-platform.py migrate \
+              --url "$TARGET_REPO_URL" \
+              --source "$SOURCE_JAVA_VERSION" \
+              --target "$TARGET_JAVA_VERSION" \
+              --push \
+              --create-pr
           fi
 
       - name: Upload migration report
