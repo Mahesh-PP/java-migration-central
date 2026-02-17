@@ -25,7 +25,7 @@ on:
           - '17'
           - '21'
       github_token:
-        description: 'GitHub Personal Access Token (PAT) - OPTIONAL (for public repos) or REQUIRED (for private repos)'
+        description: 'GitHub Personal Access Token (PAT) - REQUIRED for external repos, OPTIONAL for your own repos'
         required: false
         type: string
 
@@ -45,9 +45,15 @@ jobs:
       - name: Configure Git credentials
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "mahesh.puthanpurakkal@gmail.com"
+          git config --global user.name "GitHub Actions Bot"
           git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com" > ~/.git-credentials
+          # Use provided PAT if available, otherwise use default GITHUB_TOKEN
+          if [ -z "${{ github.event.inputs.github_token }}" ]; then
+            echo "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com" > ~/.git-credentials
+          else
+            echo "https://x-access-token:${{ github.event.inputs.github_token }}@github.com" > ~/.git-credentials
+          fi
+          chmod 600 ~/.git-credentials
 
       - name: Install dependencies
         run: |
@@ -57,11 +63,18 @@ jobs:
       - name: Validate PAT requirement (optional message)
         run: |
           if [ -z "${{ github.event.inputs.github_token }}" ]; then
-            echo "⚠️  No PAT provided - running in TEST mode"
-            echo "✅ Migration analysis will run, but PR creation will be skipped"
-            echo "🔑 To enable PR creation, provide a GitHub PAT token"
+            echo "⚠️  No PAT provided"
+            echo "❌ Cannot push to external repositories without PAT (Permission Denied 403)"
+            echo "ℹ️  For external repos like spring-petclinic: PAT is REQUIRED"
+            echo "✅ For your own repos: PAT is OPTIONAL"
+            echo ""
+            echo "🔑 How to create a PAT:"
+            echo "   1. Go to: https://github.com/settings/tokens"
+            echo "   2. Click 'Generate new token (classic)'"
+            echo "   3. Select scopes: repo, workflow"
+            echo "   4. Copy and paste the token in the PAT field"
           else
-            echo "✅ PAT provided - full workflow will execute"
+            echo "✅ PAT provided - workflow will execute with full permissions"
           fi
 
       - name: Run Java migration
@@ -101,7 +114,7 @@ jobs:
           echo "☕ Target Java Version: ${{ github.event.inputs.target_java_version }}"
           echo ""
           echo "🔍 Check the logs above for PR link (search for 'Created PR:')"
-          echo "📝 Manual check: https://github.com/spring-projects/spring-petclinic/pulls"
+          echo "📝 Manual check: ${{ github.event.inputs.repo_url }}/pulls"
           echo "========================================="
 
       - name: Upload migration report
@@ -119,3 +132,4 @@ jobs:
         run: |
           echo "🎉 Migration completed successfully!"
           echo "📝 Check the target repository for the PR: ${{ github.event.inputs.repo_url }}"
+
