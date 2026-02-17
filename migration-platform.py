@@ -582,12 +582,15 @@ jobs:
                 subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
                 if push:
-                    logger.info(f"Pushing branch {branch} to origin for {repo_name} (requires auth)")
+                    logger.info(f"Pushing branch {branch} to origin for {repo_name}")
                     try:
+                        # Try push - works for public repos with GitHub Actions default token
                         subprocess.run(['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch], check=True)
                         pushed = True
+                        logger.info(f"✅ Successfully pushed branch {branch} to {repo_name}")
                     except subprocess.CalledProcessError as e:
-                        logger.warning(f"Push failed for {repo_name}: {e}")
+                        logger.warning(f"⚠️  Push failed for {repo_name}: {e}")
+                        logger.info(f"Note: This may be expected for private repos without PAT. If using public repo, check permissions.")
                         pushed = False
                 else:
                     pushed = False
@@ -598,7 +601,18 @@ jobs:
                         pr_url = self.create_pull_request(repo_path, branch,
                                                           title=f"Migrate to Java {target}",
                                                           body=f"Automated migration branch to upgrade from Java {source} to {target}.")
-                        result['message'] += f'; PR: {pr_url}' if pr_url else '; PR not created'
+                        if pr_url:
+                            result['pr_url'] = pr_url
+                            result['message'] += f'; PR: {pr_url}'
+                            logger.info(f"✅ PULL REQUEST CREATED: {pr_url}")
+                            print(f"\n{'='*60}")
+                            print(f"🎉 PULL REQUEST CREATED!")
+                            print(f"{'='*60}")
+                            print(f"Repository: {repo_name}")
+                            print(f"PR URL: {pr_url}")
+                            print(f"{'='*60}\n")
+                        else:
+                            result['message'] += '; PR not created'
                     except Exception as e:
                         logger.warning(f"PR creation failed for {repo_name}: {e}")
 

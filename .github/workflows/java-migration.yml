@@ -25,7 +25,7 @@ on:
           - '17'
           - '21'
       github_token:
-        description: 'GitHub Personal Access Token (PAT) - OPTIONAL for testing, REQUIRED for PR creation'
+        description: 'GitHub Personal Access Token (PAT) - OPTIONAL (for public repos) or REQUIRED (for private repos)'
         required: false
         type: string
 
@@ -65,11 +65,16 @@ jobs:
           GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
           if [ -z "$GITHUB_TOKEN" ]; then
+            echo "⚠️  No PAT provided - running in PUBLIC REPO mode"
+            echo "✅ Will attempt migration on public repositories"
             python3 migration-platform.py migrate \
               --url "$TARGET_REPO_URL" \
               --source "$SOURCE_JAVA_VERSION" \
-              --target "$TARGET_JAVA_VERSION"
+              --target "$TARGET_JAVA_VERSION" \
+              --push \
+              --create-pr
           else
+            echo "✅ PAT provided - running in AUTHENTICATED mode (for private repos)"
             python3 migration-platform.py migrate \
               --url "$TARGET_REPO_URL" \
               --source "$SOURCE_JAVA_VERSION" \
@@ -77,6 +82,20 @@ jobs:
               --push \
               --create-pr
           fi
+
+      - name: Extract and Display PR Link
+        if: success() && github.event.inputs.github_token != ''
+        run: |
+          echo "========================================="
+          echo "✅ MIGRATION COMPLETED SUCCESSFULLY"
+          echo "========================================="
+          echo "📦 Target Repository: ${{ github.event.inputs.repo_url }}"
+          echo "☕ Source Java Version: ${{ github.event.inputs.source_java_version }}"
+          echo "☕ Target Java Version: ${{ github.event.inputs.target_java_version }}"
+          echo ""
+          echo "🔍 Check the logs above for PR link (search for 'Created PR:')"
+          echo "📝 Manual check: https://github.com/spring-projects/spring-petclinic/pulls"
+          echo "========================================="
 
       - name: Upload migration report
         if: always()
