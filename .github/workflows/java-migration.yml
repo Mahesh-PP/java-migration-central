@@ -1,0 +1,78 @@
+name: Java Migration Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Target repository URL (e.g., https://github.com/owner/repo)'
+        required: true
+        type: string
+      source_java_version:
+        description: 'Source Java version (e.g., 11, 17, 21)'
+        required: true
+        type: choice
+        options:
+          - '8'
+          - '11'
+          - '17'
+          - '21'
+      target_java_version:
+        description: 'Target Java version (e.g., 11, 17, 21)'
+        required: true
+        type: choice
+        options:
+          - '11'
+          - '17'
+          - '21'
+      github_token:
+        description: 'GitHub Personal Access Token (PAT) for authentication'
+        required: true
+        type: string
+
+jobs:
+  migrate-java:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout migration platform
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Java migration
+        env:
+          TARGET_REPO_URL: ${{ github.event.inputs.repo_url }}
+          SOURCE_JAVA_VERSION: ${{ github.event.inputs.source_java_version }}
+          TARGET_JAVA_VERSION: ${{ github.event.inputs.target_java_version }}
+          GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+          python migration-platform.py \
+            --repo-url "$TARGET_REPO_URL" \
+            --source-version "$SOURCE_JAVA_VERSION" \
+            --target-version "$TARGET_JAVA_VERSION" \
+            --github-token "$GITHUB_TOKEN"
+
+      - name: Upload migration report
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: migration-report
+          path: migration-report/
+          retention-days: 30
+
+      - name: Create Pull Request
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
+        run: |
+          echo "Migration completed successfully!"
+          echo "Check the target repository for the PR: ${{ github.event.inputs.repo_url }}"
+
