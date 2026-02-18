@@ -585,11 +585,14 @@ jobs:
                     logger.info(f"Pushing branch {branch} to origin for {repo_name}")
                     try:
                         # Try push - works for public repos with GitHub Actions default token
-                        subprocess.run(['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch], check=True)
+                        result_push = subprocess.run(['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch],
+                                                     capture_output=True, text=True, check=True)
                         pushed = True
                         logger.info(f"✅ Successfully pushed branch {branch} to {repo_name}")
                     except subprocess.CalledProcessError as e:
                         logger.warning(f"⚠️  Push failed for {repo_name}: {e}")
+                        logger.warning(f"STDOUT: {e.stdout if hasattr(e, 'stdout') else 'N/A'}")
+                        logger.warning(f"STDERR: {e.stderr if hasattr(e, 'stderr') else 'N/A'}")
                         logger.info(f"Note: This may be expected for private repos without PAT. If using public repo, check permissions.")
                         pushed = False
                 else:

@@ -63,10 +63,17 @@ jobs:
             AUTH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
           fi
           
-          # Configure git credentials
-          git config --global credential.helper store
+          # Export token for git to use
+          export GITHUB_TOKEN="${AUTH_TOKEN}"
+          echo "GITHUB_TOKEN=${AUTH_TOKEN}" >> $GITHUB_ENV
+          
+          # Configure git to use the token via environment variable
+          git config --global credential.helper 'store --file ~/.git-credentials'
           echo "https://x-access-token:${AUTH_TOKEN}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
+          
+          # Additional: Configure git to use HTTPS with credential helper
+          git config --global credential.useHttpPath true
 
       - name: Install dependencies
         run: |
