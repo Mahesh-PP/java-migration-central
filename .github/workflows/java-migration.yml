@@ -31,7 +31,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -67,13 +67,17 @@ jobs:
           export GITHUB_TOKEN="${AUTH_TOKEN}"
           echo "GITHUB_TOKEN=${AUTH_TOKEN}" >> $GITHUB_ENV
           
-          # Configure git to use the token via environment variable
-          git config --global credential.helper 'store --file ~/.git-credentials'
+          # Configure git to use credentials (cache method for better subprocess compatibility)
+          git config --global credential.helper cache
+          
+          # Store credentials in a way that subprocess can use them
+          printf "protocol=https\nhost=github.com\nusername=x-access-token\npassword=${AUTH_TOKEN}\n" | git credential approve
+          
+          # Also create the .git-credentials file as fallback
+          mkdir -p ~/.git
           echo "https://x-access-token:${AUTH_TOKEN}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
-          
-          # Additional: Configure git to use HTTPS with credential helper
-          git config --global credential.useHttpPath true
+          git config --global credential.helper "store --file ~/.git-credentials"
 
       - name: Install dependencies
         run: |

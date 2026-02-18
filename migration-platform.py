@@ -584,9 +584,24 @@ jobs:
                 if push:
                     logger.info(f"Pushing branch {branch} to origin for {repo_name}")
                     try:
-                        # Try push - works for public repos with GitHub Actions default token
-                        result_push = subprocess.run(['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch],
-                                                     capture_output=True, text=True, check=True)
+                        # Get the token from environment
+                        token = os.environ.get('GITHUB_TOKEN', '')
+
+                        # If we have a token, we can push with authentication
+                        if token:
+                            # Use git credential helpers that were configured in workflow
+                            result_push = subprocess.run(
+                                ['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch],
+                                capture_output=True, text=True, check=True,
+                                env={**os.environ, 'GIT_ASKPASS': '', 'GIT_TERMINAL_PROMPT': '0'}
+                            )
+                        else:
+                            # No token available, try without authentication (for public repos)
+                            result_push = subprocess.run(
+                                ['git', '-C', str(repo_path), 'push', '--set-upstream', 'origin', branch],
+                                capture_output=True, text=True, check=True
+                            )
+
                         pushed = True
                         logger.info(f"✅ Successfully pushed branch {branch} to {repo_name}")
                     except subprocess.CalledProcessError as e:
