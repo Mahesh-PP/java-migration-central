@@ -581,14 +581,22 @@ jobs:
                 if openrewrite_success:
                     logger.info(f"✅ OpenRewrite transformation completed - Java code has been migrated")
                 else:
-                    logger.warning(f"⚠️ OpenRewrite transformation skipped or failed - only config files will be in PR")
+                    logger.warning(f"⚠️ OpenRewrite transformation skipped or failed - only Java source changes will be in PR")
 
-                # Git: create branch, commit
+                # Git: create branch, commit with selective file staging
                 subprocess.run(['git', '-C', str(repo_path), 'checkout', '-b', branch], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                subprocess.run(['git', '-C', str(repo_path), 'add', '.'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                commit_msg = f'chore(migration): add migration configs for Java {source} → {target}'
-                # Allow commit to succeed even if no changes
-                subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                # Stage only Java migration-related files (skip renovate.json and .openrewrite configs)
+                stage_success, staged_files = self._stage_migration_files(repo_path)
+
+                if not stage_success or not staged_files:
+                    logger.warning(f"⚠️  No Java migration files found to commit. This may be expected if OpenRewrite made no changes.")
+                    result['message'] = 'No Java migration changes detected'
+                else:
+                    commit_msg = f'chore(migration): migrate Java {source} → {target}\n\nUpdates:\n- pom.xml with new Java version and dependencies\n- Import statements updated to Jakarta EE\n- Java source code transformed for Java {target} compatibility'
+                    # Commit the staged files
+                    subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    logger.info(f"✅ Committed {len(staged_files)} Java migration files")
 
                 if push:
                     logger.info(f"Pushing branch {branch} to origin for {repo_name}")
@@ -853,6 +861,104 @@ jobs:
         except Exception as e:
             logger.warning(f"Unexpected error creating PR: {e}")
             return None
+
+    def _stage_migration_files(self, repo_path: Path) -> Tuple[bool, List[str]]:
+        """
+        Stage only Java migration-related files for commit.
+        Excludes: renovate.json, .openrewrite/, .github/ workflows
+        Includes: pom.xml, build.gradle, Java source files, module-info.java, etc.
+
+        Returns: (success: bool, staged_files: List[str])
+        """
+        try:
+            staged_files = []
+            files_to_stage = []
+
+            # Files and patterns to include
+            include_patterns = [
+                'pom.xml',
+                'build.gradle',
+                'build.gradle.kts',
+                'gradle.properties',
+                'maven.config',
+                'src/**/*.java',
+                'module-info.java'
+            ]
+
+            # Files and patterns to EXCLUDE
+            exclude_patterns = [
+                'renovate.json',
+                '.openrewrite/**',
+                '.github/workflows/java-migration.yml',
+                '.github/workflows/**'
+            ]
+
+            # Get git status to find modified files
+            result = subprocess.run(
+                ['git', '-C', str(repo_path), 'status', '--porcelain'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            modified_files = [line[3:].strip() for line in result.stdout.split('\n') if line.strip() and line[0] in ['M', 'A', '?']]
+
+            logger.info(f"Found {len(modified_files)} modified/new files")
+
+            # Filter files based on include/exclude patterns
+            for file_path in modified_files:
+                should_include = False
+
+                # Check if file matches any include pattern
+                for pattern in include_patterns:
+                    if '*' in pattern:
+                        # Glob pattern
+                        import fnmatch
+                        if fnmatch.fnmatch(file_path, pattern):
+                            should_include = True
+                            break
+                    else:
+                        # Exact or simple match
+                        if file_path == pattern or file_path.endswith(pattern):
+                            should_include = True
+                            break
+
+                # Check if file matches any exclude pattern
+                for pattern in exclude_patterns:
+                    if '*' in pattern:
+                        import fnmatch
+                        if fnmatch.fnmatch(file_path, pattern):
+                            should_include = False
+                            break
+                    else:
+                        if file_path == pattern or file_path.startswith(pattern):
+                            should_include = False
+                            break
+
+                if should_include:
+                    files_to_stage.append(file_path)
+                    staged_files.append(file_path)
+                    logger.info(f"  ✅ Including: {file_path}")
+                else:
+                    logger.info(f"  ⏭️  Skipping: {file_path}")
+
+            # Stage the filtered files
+            if files_to_stage:
+                for file_path in files_to_stage:
+                    subprocess.run(
+                        ['git', '-C', str(repo_path), 'add', file_path],
+                        capture_output=True,
+                        check=True
+                    )
+                logger.info(f"✅ Staged {len(files_to_stage)} Java migration files")
+                return True, staged_files
+            else:
+                logger.warning(f"⚠️  No Java migration files to stage")
+                return False, []
+
+        except Exception as e:
+            logger.error(f"Error staging migration files: {e}")
+            return False, []
 
 def main():
     """Main CLI interface"""
