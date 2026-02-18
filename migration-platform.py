@@ -574,7 +574,7 @@ jobs:
                 with open(gha_dir / 'java-migration.yml', 'w') as f:
                     f.write(gha)
 
-                # **NEW: Run OpenRewrite to actually transform Java code**
+                # **Run OpenRewrite to transform Java code and pom.xml**
                 logger.info(f"⚡ Starting OpenRewrite code transformation")
                 openrewrite_success = self.run_openrewrite_migration(repo_path, source, target)
 
@@ -713,8 +713,9 @@ jobs:
 
         return results
 
+
     def run_openrewrite_migration(self, repo_path: Path, source: str, target: str) -> bool:
-        """Run OpenRewrite to transform Java code
+        """Run OpenRewrite to transform Java code and pom.xml
 
         Returns True to continue (transformation is optional)
         """
@@ -744,10 +745,10 @@ jobs:
                             'mvn',
                             'org.openrewrite.maven:rewrite-maven-plugin:run',
                             f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
-                            f'-Drewrite.activeRecipes={recipe}',
-                            '-q'
+                            f'-Drewrite.activeRecipes={recipe}'
                         ]
 
+                        logger.info(f"🔧 Running: {' '.join(cmd)}")
                         result = subprocess.run(
                             cmd,
                             cwd=str(repo_path),
@@ -756,11 +757,19 @@ jobs:
                             timeout=300
                         )
 
-                        if result.returncode == 0:
-                            logger.info(f"✅ OpenRewrite transformation completed")
+                        logger.info(f"OpenRewrite exit code: {result.returncode}")
+
+                        if result.stdout:
+                            logger.debug(f"OpenRewrite stdout:\n{result.stdout}")
+                        if result.stderr:
+                            logger.debug(f"OpenRewrite stderr:\n{result.stderr}")
+
+                        # Exit code 0 or 1 both mean success (0=changes made, 1=no changes needed)
+                        if result.returncode in [0, 1]:
+                            logger.info(f"✅ OpenRewrite transformation completed successfully")
                             return True
                         else:
-                            logger.info(f"ℹ️ OpenRewrite execution completed with status {result.returncode}")
+                            logger.warning(f"⚠️ OpenRewrite execution returned status {result.returncode}")
                             return True
                     except FileNotFoundError:
                         logger.info(f"ℹ️ Maven not available - configuration files will be provided for manual migration")
@@ -865,32 +874,29 @@ jobs:
     def _stage_migration_files(self, repo_path: Path) -> Tuple[bool, List[str]]:
         """
         Stage only Java migration-related files for commit.
-        Excludes: renovate.json, .openrewrite/, .github/ workflows
+        Excludes: renovate.json, .openrewrite/, .github/, target/, build artifacts
         Includes: pom.xml, build.gradle, Java source files, module-info.java, etc.
 
         Returns: (success: bool, staged_files: List[str])
         """
+        import fnmatch
+
         try:
             staged_files = []
             files_to_stage = []
 
-            # Files and patterns to include
-            include_patterns = [
-                'pom.xml',
-                'build.gradle',
-                'build.gradle.kts',
-                'gradle.properties',
-                'maven.config',
-                'src/**/*.java',
-                'module-info.java'
-            ]
-
-            # Files and patterns to EXCLUDE
-            exclude_patterns = [
+            # Explicit folders/files to EXCLUDE (build artifacts, config)
+            exclude_prefixes = [
                 'renovate.json',
-                '.openrewrite/**',
-                '.github/workflows/java-migration.yml',
-                '.github/workflows/**'
+                '.openrewrite/',
+                '.github/',
+                'target/',
+                'build/',
+                '.gradle/',
+                '.idea/',
+                '.vscode/',
+                '*.class',
+                '*.jar'
             ]
 
             # Get git status to find modified files
@@ -903,44 +909,70 @@ jobs:
 
             modified_files = [line[3:].strip() for line in result.stdout.split('\n') if line.strip() and line[0] in ['M', 'A', '?']]
 
-            logger.info(f"Found {len(modified_files)} modified/new files")
+            logger.info(f"Found {len(modified_files)} modified/new files in git status")
 
-            # Filter files based on include/exclude patterns
+            # Also always check for pom.xml and build files that might need to be included
+            always_check_files = ['pom.xml', 'build.gradle', 'build.gradle.kts']
+            for check_file in always_check_files:
+                check_path = repo_path / check_file
+                if check_path.exists() and check_file not in modified_files:
+                    logger.info(f"  ℹ️ Adding existing file for consideration: {check_file}")
+                    modified_files.append(check_file)
+
+            # Filter files: exclude build artifacts, include migration files
             for file_path in modified_files:
-                should_include = False
+                should_skip = False
+                skip_reason = ""
 
-                # Check if file matches any include pattern
-                for pattern in include_patterns:
-                    if '*' in pattern:
-                        # Glob pattern
-                        import fnmatch
-                        if fnmatch.fnmatch(file_path, pattern):
-                            should_include = True
+                # Check if file should be excluded
+                for exclude in exclude_prefixes:
+                    if exclude.startswith('.'):
+                        # Exact match for dotfiles
+                        if file_path == exclude or file_path.startswith(exclude):
+                            should_skip = True
+                            skip_reason = f"matches exclude pattern: {exclude}"
+                            break
+                    elif '/' in exclude:
+                        # Directory prefix match
+                        if file_path.startswith(exclude):
+                            should_skip = True
+                            skip_reason = f"is in excluded directory: {exclude}"
                             break
                     else:
-                        # Exact or simple match
-                        if file_path == pattern or file_path.endswith(pattern):
-                            should_include = True
+                        # File pattern match
+                        if fnmatch.fnmatch(file_path, exclude):
+                            should_skip = True
+                            skip_reason = f"matches exclude pattern: {exclude}"
                             break
 
-                # Check if file matches any exclude pattern
-                for pattern in exclude_patterns:
-                    if '*' in pattern:
-                        import fnmatch
-                        if fnmatch.fnmatch(file_path, pattern):
-                            should_include = False
-                            break
+                # Additional checks: include only relevant files
+                if not should_skip:
+                    # Include Java source files
+                    if file_path.endswith('.java'):
+                        should_skip = False
+                    # Include build config files
+                    elif file_path in ['pom.xml', 'build.gradle', 'build.gradle.kts', 'gradle.properties', 'maven.config']:
+                        should_skip = False
+                    # Include module descriptor
+                    elif file_path.endswith('module-info.java'):
+                        should_skip = False
+                    # Include properties files in src
+                    elif file_path.startswith('src/') and file_path.endswith('.properties'):
+                        should_skip = False
+                    # Include XML/YML config in src
+                    elif file_path.startswith('src/') and (file_path.endswith('.xml') or file_path.endswith('.yml') or file_path.endswith('.yaml')):
+                        should_skip = False
                     else:
-                        if file_path == pattern or file_path.startswith(pattern):
-                            should_include = False
-                            break
+                        # Skip anything else (build artifacts, resources, etc.)
+                        should_skip = True
+                        skip_reason = "not a Java migration file"
 
-                if should_include:
+                if not should_skip:
                     files_to_stage.append(file_path)
                     staged_files.append(file_path)
                     logger.info(f"  ✅ Including: {file_path}")
                 else:
-                    logger.info(f"  ⏭️  Skipping: {file_path}")
+                    logger.debug(f"  ⏭️  Skipping: {file_path} ({skip_reason})")
 
             # Stage the filtered files
             if files_to_stage:
@@ -950,14 +982,16 @@ jobs:
                         capture_output=True,
                         check=True
                     )
-                logger.info(f"✅ Staged {len(files_to_stage)} Java migration files")
+                logger.info(f"✅ Staged {len(files_to_stage)} Java migration files for commit")
                 return True, staged_files
             else:
-                logger.warning(f"⚠️  No Java migration files to stage")
+                logger.warning(f"⚠️  No Java migration files to stage - OpenRewrite may not have found changes to make")
                 return False, []
 
         except Exception as e:
             logger.error(f"Error staging migration files: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return False, []
 
 def main():
