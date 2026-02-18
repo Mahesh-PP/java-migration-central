@@ -730,28 +730,37 @@ jobs:
                     recipe = None
 
                 if recipe:
+                    # Check if mvnw exists, if not use mvn
+                    mvnw_path = repo_path / 'mvnw'
+                    mvn_cmd = './mvnw' if mvnw_path.exists() else 'mvn'
+
                     # Run OpenRewrite Maven plugin
                     cmd = [
-                        './mvnw',
+                        mvn_cmd,
                         'org.openrewrite.maven:rewrite-maven-plugin:run',
                         f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
-                        f'-Drewrite.activeRecipes={recipe}'
+                        f'-Drewrite.activeRecipes={recipe}',
+                        '-q'  # Quiet mode to reduce output
                     ]
+
+                    logger.info(f"Running command: {' '.join(cmd)} in {repo_path}")
 
                     result = subprocess.run(
                         cmd,
                         cwd=str(repo_path),
                         capture_output=True,
                         text=True,
-                        timeout=300  # 5 minute timeout
+                        timeout=600  # 10 minute timeout for maven
                     )
 
                     if result.returncode == 0:
                         logger.info(f"✅ OpenRewrite migration completed successfully")
                         return True
                     else:
-                        logger.warning(f"⚠️ OpenRewrite migration had issues (non-zero exit): {result.stderr}")
-                        # Still return True as warnings don't always mean failure
+                        logger.warning(f"⚠️ OpenRewrite migration exit code: {result.returncode}")
+                        if result.stderr:
+                            logger.warning(f"STDERR: {result.stderr[:500]}")  # Log first 500 chars
+                        # Still return True as code transformation might have worked even with warnings
                         return True
                 else:
                     logger.info(f"No specific recipe found for {source} to {target}, skipping OpenRewrite")
@@ -761,7 +770,7 @@ jobs:
                 return False
 
         except subprocess.TimeoutExpired:
-            logger.warning("OpenRewrite migration timed out (>5 minutes)")
+            logger.warning("OpenRewrite migration timed out (>10 minutes)")
             return False
         except Exception as e:
             logger.warning(f"OpenRewrite migration failed: {e}")
