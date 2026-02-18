@@ -51,9 +51,25 @@ jobs:
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
+          
+          # Get the PAT from the secret
+          PAT_TOKEN="${{ secrets.CROSS_REPO_PAT }}"
+          
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "❌ ERROR: CROSS_REPO_PAT secret is not configured!"
+            echo "Please add your GitHub PAT to: Settings → Secrets and variables → Actions → New repository secret"
+            exit 1
+          fi
+          
+          # Configure git to use the PAT
           git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.CROSS_REPO_PAT }}@github.com" > ~/.git-credentials
+          echo "https://x-access-token:${PAT_TOKEN}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
+          
+          # Export GITHUB_TOKEN for Python script
+          echo "GITHUB_TOKEN=${PAT_TOKEN}" >> $GITHUB_ENV
+          
+          echo "✅ Git credentials configured successfully"
 
       - name: Install dependencies
         run: |
