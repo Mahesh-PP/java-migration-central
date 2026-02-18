@@ -50,34 +50,10 @@ jobs:
       - name: Configure Git credentials
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "GitHub Actions Bot"
-          
-          # Determine which token to use
-          if [ -n "${{ github.event.inputs.github_token }}" ]; then
-            # Use provided PAT
-            echo "Using provided GitHub PAT"
-            AUTH_TOKEN="${{ github.event.inputs.github_token }}"
-          else
-            # Use default workflow token (works for your own repos)
-            echo "Using workflow GITHUB_TOKEN (default)"
-            AUTH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          fi
-          
-          # Export token for git to use
-          export GITHUB_TOKEN="${AUTH_TOKEN}"
-          echo "GITHUB_TOKEN=${AUTH_TOKEN}" >> $GITHUB_ENV
-          
-          # Configure git to use credentials (cache method for better subprocess compatibility)
-          git config --global credential.helper cache
-          
-          # Store credentials in a way that subprocess can use them
-          printf "protocol=https\nhost=github.com\nusername=x-access-token\npassword=${AUTH_TOKEN}\n" | git credential approve
-          
-          # Also create the .git-credentials file as fallback
-          mkdir -p ~/.git
-          echo "https://x-access-token:${AUTH_TOKEN}@github.com" > ~/.git-credentials
+          git config --global user.name "github-actions[bot]"
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.CROSS_REPO_PAT }}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
-          git config --global credential.helper "store --file ~/.git-credentials"
 
       - name: Install dependencies
         run: |
@@ -102,6 +78,7 @@ jobs:
           TARGET_REPO_URL: ${{ github.event.inputs.repo_url }}
           SOURCE_JAVA_VERSION: ${{ github.event.inputs.source_java_version }}
           TARGET_JAVA_VERSION: ${{ github.event.inputs.target_java_version }}
+          GITHUB_TOKEN: ${{ secrets.CROSS_REPO_PAT }}
         run: |
           python3 migration-platform.py migrate \
             --url "$TARGET_REPO_URL" \
