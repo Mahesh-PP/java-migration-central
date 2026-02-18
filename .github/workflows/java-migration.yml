@@ -17,17 +17,22 @@ on:
           - '17'
           - '21'
       target_java_version:
-        description: 'Target Java version (e.g., 11, 17, 21)'
+        description: 'Target Java version (e.g., 11, 17, 21, 25)'
         required: true
         type: choice
         options:
           - '11'
           - '17'
           - '21'
+          - '25'
       github_token:
-        description: 'GitHub Personal Access Token (PAT) - REQUIRED for external repos, OPTIONAL for your own repos'
+        description: 'GitHub Personal Access Token (PAT) - OPTIONAL (uses workflow token by default)'
         required: false
         type: string
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   migrate-java:
@@ -46,13 +51,21 @@ jobs:
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "GitHub Actions Bot"
-          git config --global credential.helper store
-          # Use provided PAT if available, otherwise use default GITHUB_TOKEN
-          if [ -z "${{ github.event.inputs.github_token }}" ]; then
-            echo "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com" > ~/.git-credentials
+          
+          # Determine which token to use
+          if [ -n "${{ github.event.inputs.github_token }}" ]; then
+            # Use provided PAT
+            echo "Using provided GitHub PAT"
+            AUTH_TOKEN="${{ github.event.inputs.github_token }}"
           else
-            echo "https://x-access-token:${{ github.event.inputs.github_token }}@github.com" > ~/.git-credentials
+            # Use default workflow token (works for your own repos)
+            echo "Using workflow GITHUB_TOKEN (default)"
+            AUTH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
           fi
+          
+          # Configure git credentials
+          git config --global credential.helper store
+          echo "https://x-access-token:${AUTH_TOKEN}@github.com" > ~/.git-credentials
           chmod 600 ~/.git-credentials
 
       - name: Install dependencies
@@ -60,21 +73,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate PAT requirement (optional message)
+      - name: Display authentication mode
         run: |
-          if [ -z "${{ github.event.inputs.github_token }}" ]; then
-            echo "⚠️  No PAT provided"
-            echo "❌ Cannot push to external repositories without PAT (Permission Denied 403)"
-            echo "ℹ️  For external repos like spring-petclinic: PAT is REQUIRED"
-            echo "✅ For your own repos: PAT is OPTIONAL"
-            echo ""
-            echo "🔑 How to create a PAT:"
-            echo "   1. Go to: https://github.com/settings/tokens"
-            echo "   2. Click 'Generate new token (classic)'"
-            echo "   3. Select scopes: repo, workflow"
-            echo "   4. Copy and paste the token in the PAT field"
+          if [ -n "${{ github.event.inputs.github_token }}" ]; then
+            echo "🔑 Authentication Mode: Custom PAT (for external/private repos)"
+            echo "✅ Can push to any repository accessible with the PAT"
           else
-            echo "✅ PAT provided - workflow will execute with full permissions"
+            echo "🔑 Authentication Mode: Workflow Token (default)"
+            echo "✅ Can push to your own repositories and public repos with write access"
+            echo "❌ Cannot push to external repos like spring-projects/spring-petclinic"
+            echo ""
+            echo "📝 If pushing to an external repo fails, provide a PAT with 'repo' scope"
           fi
 
       - name: Run Java migration
@@ -82,39 +91,26 @@ jobs:
           TARGET_REPO_URL: ${{ github.event.inputs.repo_url }}
           SOURCE_JAVA_VERSION: ${{ github.event.inputs.source_java_version }}
           TARGET_JAVA_VERSION: ${{ github.event.inputs.target_java_version }}
-          GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
         run: |
-          if [ -z "$GITHUB_TOKEN" ]; then
-            echo "⚠️  No PAT provided - running in PUBLIC REPO mode"
-            echo "✅ Will attempt migration on public repositories"
-            python3 migration-platform.py migrate \
-              --url "$TARGET_REPO_URL" \
-              --source "$SOURCE_JAVA_VERSION" \
-              --target "$TARGET_JAVA_VERSION" \
-              --push \
-              --create-pr
-          else
-            echo "✅ PAT provided - running in AUTHENTICATED mode (for private repos)"
-            python3 migration-platform.py migrate \
-              --url "$TARGET_REPO_URL" \
-              --source "$SOURCE_JAVA_VERSION" \
-              --target "$TARGET_JAVA_VERSION" \
-              --push \
-              --create-pr
-          fi
+          python3 migration-platform.py migrate \
+            --url "$TARGET_REPO_URL" \
+            --source "$SOURCE_JAVA_VERSION" \
+            --target "$TARGET_JAVA_VERSION" \
+            --push \
+            --create-pr
 
-      - name: Extract and Display PR Link
-        if: success() && github.event.inputs.github_token != ''
+      - name: Display Migration Results
+        if: success()
         run: |
           echo "========================================="
-          echo "✅ MIGRATION COMPLETED SUCCESSFULLY"
+          echo "✅ MIGRATION COMPLETED"
           echo "========================================="
           echo "📦 Target Repository: ${{ github.event.inputs.repo_url }}"
           echo "☕ Source Java Version: ${{ github.event.inputs.source_java_version }}"
           echo "☕ Target Java Version: ${{ github.event.inputs.target_java_version }}"
           echo ""
-          echo "🔍 Check the logs above for PR link (search for 'Created PR:')"
-          echo "📝 Manual check: ${{ github.event.inputs.repo_url }}/pulls"
+          echo "🔍 Check logs above for PR link (search for 'Created PR:')"
+          echo "📝 Or visit: ${{ github.event.inputs.repo_url }}/pulls"
           echo "========================================="
 
       - name: Upload migration report
@@ -124,12 +120,3 @@ jobs:
           name: migration-report
           path: migration-report/
           retention-days: 30
-
-      - name: Create Pull Request
-        if: success() && github.event.inputs.github_token != ''
-        env:
-          GITHUB_TOKEN: ${{ github.event.inputs.github_token }}
-        run: |
-          echo "🎉 Migration completed successfully!"
-          echo "📝 Check the target repository for the PR: ${{ github.event.inputs.repo_url }}"
-
