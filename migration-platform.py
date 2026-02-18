@@ -595,8 +595,12 @@ jobs:
                 else:
                     commit_msg = f'chore(migration): migrate Java {source} → {target}\n\nUpdates:\n- pom.xml with new Java version and dependencies\n- Import statements updated to Jakarta EE\n- Java source code transformed for Java {target} compatibility'
                     # Commit the staged files
-                    subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    logger.info(f"✅ Committed {len(staged_files)} Java migration files")
+                    commit_result = subprocess.run(['git', '-C', str(repo_path), 'commit', '-m', commit_msg], capture_output=True, text=True)
+                    if commit_result.returncode == 0:
+                        logger.info(f"✅ Committed {len(staged_files)} Java migration files")
+                    else:
+                        logger.warning(f"⚠️  Commit may have failed: {commit_result.stderr}")
+                        result['message'] = 'Commit failed - no changes to commit'
 
                 if push:
                     logger.info(f"Pushing branch {branch} to origin for {repo_name}")
@@ -634,21 +638,28 @@ jobs:
                 # Optionally create a PR (only if push succeeded and create_pr requested)
                 if create_pr and pushed:
                     try:
-                        pr_url = self.create_pull_request(repo_path, branch,
-                                                          title=f"Migrate to Java {target}",
-                                                          body=f"Automated migration branch to upgrade from Java {source} to {target}.")
-                        if pr_url:
-                            result['pr_url'] = pr_url
-                            result['message'] += f'; PR: {pr_url}'
-                            logger.info(f"✅ PULL REQUEST CREATED: {pr_url}")
-                            print(f"\n{'='*60}")
-                            print(f"🎉 PULL REQUEST CREATED!")
-                            print(f"{'='*60}")
-                            print(f"Repository: {repo_name}")
-                            print(f"PR URL: {pr_url}")
-                            print(f"{'='*60}\n")
+                        # **Check if branch has commits ahead of base**
+                        commits_ahead = self._check_commits_ahead(repo_path, 'origin', branch)
+                        if commits_ahead <= 0:
+                            logger.warning(f"⚠️  Branch {branch} has no commits ahead of base - skipping PR creation")
+                            result['message'] += f'; No commits ahead to create PR'
                         else:
-                            result['message'] += '; PR not created'
+                            logger.info(f"✅ Branch has {commits_ahead} commit(s) ahead of base")
+                            pr_url = self.create_pull_request(repo_path, branch,
+                                                              title=f"Migrate to Java {target}",
+                                                              body=f"Automated migration branch to upgrade from Java {source} to {target}.")
+                            if pr_url:
+                                result['pr_url'] = pr_url
+                                result['message'] += f'; PR: {pr_url}'
+                                logger.info(f"✅ PULL REQUEST CREATED: {pr_url}")
+                                print(f"\n{'='*60}")
+                                print(f"🎉 PULL REQUEST CREATED!")
+                                print(f"{'='*60}")
+                                print(f"Repository: {repo_name}")
+                                print(f"PR URL: {pr_url}")
+                                print(f"{'='*60}\n")
+                            else:
+                                result['message'] += '; PR not created'
                     except Exception as e:
                         logger.warning(f"PR creation failed for {repo_name}: {e}")
 
@@ -993,6 +1004,32 @@ jobs:
             import traceback
             logger.debug(traceback.format_exc())
             return False, []
+
+    def _check_commits_ahead(self, repo_path: Path, remote: str, branch: str) -> int:
+        """Check how many commits the branch is ahead of the base branch.
+
+        Compares the given branch with the upstream tracking branch (origin/branch).
+
+        Returns the number of commits ahead, or 0 if equal.
+        """
+        try:
+            # Fetch latest from origin
+            subprocess.run(['git', '-C', str(repo_path), 'fetch', remote], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # Compare commits
+            result = subprocess.run(
+                ['git', '-C', str(repo_path), 'rev-list', '--count', f'HEAD..{remote}/{branch}'],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            commits_ahead = int(result.stdout.decode().strip())
+            logger.info(f"Branch {branch} is {commits_ahead} commit(s) ahead of {remote}/{branch}")
+            return commits_ahead
+        except Exception as e:
+            logger.warning(f"Could not determine commits ahead for {branch}: {e}")
+            return 0
 
 def main():
     """Main CLI interface"""
