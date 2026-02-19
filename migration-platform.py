@@ -780,7 +780,7 @@ jobs:
                             logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
 
                         # Priority 3: Use default ~/.m2/settings.xml if it exists
-                        elif Path.home() / '.m2' / 'settings.xml' in [Path.home() / '.m2' / 'settings.xml']:
+                        else:
                             default_settings = Path.home() / '.m2' / 'settings.xml'
                             if default_settings.exists():
                                 maven_settings_path = str(default_settings)
@@ -789,13 +789,19 @@ jobs:
                         if maven_settings_path:
                             cmd.extend(['-s', maven_settings_path])
 
+                        # Add Maven options to handle offline mode and skip repository resolution issues
+                        # This allows OpenRewrite to work even if some repositories are unavailable
+                        cmd.extend([
+                            '-o',  # Offline mode to use local cache only
+                            '-DskipTests',  # Skip tests
+                            '-Dorg.slf4j.simpleLogger.defaultLogLevel=info',  # Control logging
+                        ])
+
                         # Add the OpenRewrite plugin invocation and recipe flags
                         cmd.extend([
                             'org.openrewrite.maven:rewrite-maven-plugin:run',
                             f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
                             f'-Drewrite.activeRecipes={recipe}',
-                            '-DskipTests',  # Skip tests to speed up OpenRewrite
-                            '-Dorg.slf4j.simpleLogger.defaultLogLevel=info'  # Control logging
                         ])
 
                         logger.info(f"🔧 Running: mvn org.openrewrite.maven:rewrite-maven-plugin:run -Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST -Drewrite.activeRecipes={recipe}")
@@ -832,20 +838,53 @@ jobs:
 
                         has_fatal_error = any(ind in stderr_lower or ind in stdout_lower for ind in fatal_indicators)
 
-                        if has_fatal_error:
-                            logger.warning("⚠️ Maven could not build the project (auth/repository issue)")
+                        if has_fatal_error and result.returncode != 0:
+                            logger.warning("⚠️ Maven/OpenRewrite failed due to repository/auth issues")
                             logger.info(f"Maven error details:\n{stderr_full}")
-                            logger.info("📝 Falling back to manual pom.xml updates")
+                            logger.info("📝 Retrying without offline mode to download dependencies...")
 
-                            # Manually update pom.xml with target version
-                            self._manually_update_pom(repo_path, source, target)
-                            return True
+                            # Retry without offline mode to download missing dependencies
+                            cmd_retry = [
+                                'mvn',
+                            ]
+
+                            if maven_settings_path:
+                                cmd_retry.extend(['-s', maven_settings_path])
+
+                            # Remove offline flag and try again
+                            cmd_retry.extend([
+                                '-DskipTests',
+                                '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
+                                'org.openrewrite.maven:rewrite-maven-plugin:run',
+                                f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
+                                f'-Drewrite.activeRecipes={recipe}',
+                            ])
+
+                            logger.info(f"🔧 Retrying with online mode...")
+                            result_retry = subprocess.run(
+                                cmd_retry,
+                                cwd=str(repo_path),
+                                capture_output=True,
+                                text=True,
+                                timeout=300
+                            )
+
+                            logger.info(f"OpenRewrite retry exit code: {result_retry.returncode}")
+
+                            if result_retry.returncode in [0, 1]:
+                                logger.info(f"✅ OpenRewrite transformation completed on retry")
+                                return True
+                            else:
+                                logger.warning(f"⚠️ OpenRewrite still failed on retry")
+                                if result_retry.stderr:
+                                    logger.info(f"Retry stderr:\n{result_retry.stderr}")
+                                return False
 
                         # Exit code 0 or 1 typically indicate the recipe applied (0) or no changes needed (1)
                         if result.returncode in [0, 1]:
                             logger.info(f"✅ OpenRewrite transformation completed successfully")
 
-                            # Check if pom.xml was actually modified
+                            # Check if pom.xml was actually modified by OpenRewrite
                             git_status = subprocess.run(
                                 ['git', '-C', str(repo_path), 'status', '--porcelain'],
                                 capture_output=True,
@@ -854,28 +893,22 @@ jobs:
                             if 'pom.xml' in git_status.stdout:
                                 logger.info(f"✅ pom.xml has been updated by OpenRewrite")
                             else:
-                                logger.info(f"ℹ️ pom.xml not modified by OpenRewrite, applying manual updates")
-                                self._manually_update_pom(repo_path, source, target)
+                                logger.info(f"ℹ️ pom.xml not modified (may already be at target version)")
 
                             return True
                         else:
-                            logger.warning(f"⚠️ OpenRewrite execution returned unexpected status {result.returncode}")
+                            logger.warning(f"⚠️ OpenRewrite execution returned status {result.returncode}")
                             if result.stderr:
                                 logger.info(f"OpenRewrite stderr:\n{result.stderr}")
-
-                            # Try manual fallback
-                            logger.info("📝 Attempting manual pom.xml updates as fallback")
-                            self._manually_update_pom(repo_path, source, target)
-                            return True
+                            return False
 
                     except FileNotFoundError:
-                        logger.info(f"ℹ️ Maven not available - applying manual pom.xml updates")
-                        self._manually_update_pom(repo_path, source, target)
-                        return True
+                        logger.warning(f"⚠️ Maven not available on system")
+                        logger.info(f"ℹ️ Please install Maven to run OpenRewrite transformations")
+                        return False
                     except subprocess.TimeoutExpired:
-                        logger.info(f"ℹ️ OpenRewrite operation timed out - applying manual pom.xml updates")
-                        self._manually_update_pom(repo_path, source, target)
-                        return True
+                        logger.warning(f"⚠️ OpenRewrite operation timed out (>300s)")
+                        return False
                 else:
                     logger.info(f"No recipe for {source} → {target}")
                     return True
@@ -884,57 +917,10 @@ jobs:
                 return True
 
         except Exception as e:
-            logger.info(f"ℹ️ OpenRewrite transformation skipped: {e}")
-            logger.info(f"Configuration files have been created - actual code transformation may need manual setup")
-            return True  # Always return True to continue with PR creation
-
-    def _manually_update_pom(self, repo_path: Path, source: str, target: str):
-        """Manually update pom.xml with target Java version and dependencies"""
-        try:
-            pom_file = repo_path / 'pom.xml'
-            if not pom_file.exists():
-                logger.debug("pom.xml not found for manual update")
-                return
-
-            with open(pom_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-
-            original_content = content
-
-            # Update java.version property
-            content = content.replace(
-                f'<java.version>{source}</java.version>',
-                f'<java.version>{target}</java.version>'
-            )
-
-            # Update Spring Boot version for major migrations
-            if source == "8" and target == "11":
-                content = content.replace('<spring-boot.version>2.3', '<spring-boot.version>2.5')
-                content = content.replace('<spring.version>5.2', '<spring.version>5.3')
-                content = content.replace('<maven.compiler.version>3.8', '<maven.compiler.version>3.9')
-            elif source == "11" and target == "17":
-                content = content.replace('<spring-boot.version>2.6', '<spring-boot.version>2.7')
-                content = content.replace('<spring.version>5.3', '<spring.version>5.3')
-                content = content.replace('<maven.compiler.version>3.9', '<maven.compiler.version>3.10')
-            elif source == "17" and target == "21":
-                content = content.replace('<spring-boot.version>2.7', '<spring-boot.version>3.1')
-                content = content.replace('<spring-boot.version>3.0', '<spring-boot.version>3.1')
-                content = content.replace('<spring.version>5.3', '<spring.version>6.0')
-                content = content.replace('<maven.compiler.version>3.10', '<maven.compiler.version>3.11')
-            elif source == "21" and target == "25":
-                content = content.replace('<spring-boot.version>3.2', '<spring-boot.version>3.4')
-                content = content.replace('<spring.version>6.0', '<spring.version>6.1')
-                content = content.replace('<maven.compiler.version>3.11', '<maven.compiler.version>3.13')
-
-            if content != original_content:
-                with open(pom_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                logger.info(f"✅ Manually updated pom.xml: Java {source} → {target}")
-            else:
-                logger.debug(f"No pom.xml changes needed (version already {target} or property name differs)")
-
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to manually update pom.xml: {e}")
+            logger.error(f"⚠️ OpenRewrite transformation error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return False
 
     def _stage_migration_files(self, repo_path: Path) -> Tuple[bool, List[str]]:
         """
@@ -950,7 +936,7 @@ jobs:
             staged_files = []
             files_to_stage = []
 
-            # Explicit folders/files to EXCLUDE (build artifacts, config)
+            # Explicit folders/files to EXCLUDE
             exclude_prefixes = [
                 'renovate.json',
                 '.openrewrite/',
@@ -1114,6 +1100,78 @@ jobs:
             logger.warning(f"Could not determine commits ahead for {branch}: {e}")
             return 0
 
+    def create_pull_request(self, repo_path: Path, branch: str, title: str, body: str) -> Optional[str]:
+        """Create a GitHub Pull Request for the pushed branch."""
+        try:
+            # Get origin URL
+            proc = subprocess.run(['git', '-C', str(repo_path), 'config', '--get', 'remote.origin.url'], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            origin_url = proc.stdout.decode().strip()
+            if 'github.com' not in origin_url:
+                logger.info(f"Origin is not GitHub, skipping PR creation: {origin_url}")
+                return None
+
+            # Parse owner and repo
+            owner = None
+            repo = None
+            if origin_url.startswith('git@'):
+                parts = origin_url.split(':', 1)
+                if len(parts) == 2:
+                    owner_repo = parts[1]
+                    if owner_repo.endswith('.git'):
+                        owner_repo = owner_repo[:-4]
+                    if '/' in owner_repo:
+                        owner, repo = owner_repo.split('/', 1)
+            else:
+                parsed = urlparse(origin_url)
+                path = parsed.path.lstrip('/')
+                if path.endswith('.git'):
+                    path = path[:-4]
+                if '/' in path:
+                    owner, repo = path.split('/', 1)
+
+            if not owner or not repo:
+                logger.info(f"Could not parse GitHub owner/repo from origin: {origin_url}")
+                return None
+
+            token = os.environ.get('GITHUB_TOKEN')
+            if not token:
+                logger.info('GITHUB_TOKEN not set; skipping PR creation')
+                return None
+
+            api_base = f'https://api.github.com/repos/{owner}/{repo}'
+
+            # Get default branch for base
+            headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github.v3+json'}
+            r = requests.get(api_base, headers=headers, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"Failed to fetch repo info from GitHub: {r.status_code} {r.text}")
+                return None
+            repo_info = r.json()
+            base_branch = repo_info.get('default_branch', 'main')
+
+            # Create PR
+            pr_payload = {
+                'title': title,
+                'head': branch,
+                'base': base_branch,
+                'body': body
+            }
+            pr_r = requests.post(f'{api_base}/pulls', headers=headers, json=pr_payload, timeout=15)
+            if pr_r.status_code in (200, 201):
+                pr = pr_r.json()
+                pr_url = pr.get('html_url')
+                logger.info(f"Created PR: {pr_url}")
+                return pr_url
+            else:
+                logger.warning(f"Failed to create PR: {pr_r.status_code} {pr_r.text}")
+                return None
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Git error while determining origin for PR creation: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Unexpected error creating PR: {e}")
+            return None
+
 def main():
     """Main CLI interface"""
     parser = argparse.ArgumentParser(description='Java Migration Central Platform')
@@ -1140,7 +1198,7 @@ def main():
     templates_parser = subparsers.add_parser('create-templates',
                                             help='Create migration templates')
 
-    # Migrate command - accepts multiple --url or a --csv file
+    # Migrate command
     migrate_parser = subparsers.add_parser('migrate', help='Prepare migration for one or more repositories')
     migrate_parser.add_argument('--url', action='append', help='Repository URL (can be specified multiple times)')
     migrate_parser.add_argument('--csv', help='CSV file with repository URLs (one per line)')
