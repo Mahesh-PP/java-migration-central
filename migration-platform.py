@@ -753,11 +753,38 @@ jobs:
                     # Try to run Maven with OpenRewrite, but don't fail if it's not available
                     try:
                         cmd = [
-                            'mvn',
+                            'mvn'
+                        ]
+
+                        # Allow custom settings.xml to be provided via env
+                        maven_settings_path = None
+                        # If user provided a path to settings.xml
+                        if os.environ.get('MAVEN_SETTINGS_PATH'):
+                            maven_settings_path = os.environ.get('MAVEN_SETTINGS_PATH')
+                        # If user provided base64-encoded settings.xml content
+                        elif os.environ.get('MAVEN_SETTINGS_BASE64'):
+                            import base64, tempfile
+                            encoded = os.environ.get('MAVEN_SETTINGS_BASE64')
+                            try:
+                                data = base64.b64decode(encoded)
+                                tmp_dir = tempfile.mkdtemp(prefix='mvn-settings-')
+                                settings_file = os.path.join(tmp_dir, 'settings.xml')
+                                with open(settings_file, 'wb') as sf:
+                                    sf.write(data)
+                                maven_settings_path = settings_file
+                                logger.info(f"Using temporary Maven settings file: {settings_file}")
+                            except Exception as e:
+                                logger.warning(f"Could not decode MAVEN_SETTINGS_BASE64: {e}")
+
+                        if maven_settings_path:
+                            cmd.extend(['-s', maven_settings_path])
+
+                        # Add the OpenRewrite plugin invocation and recipe flags
+                        cmd.extend([
                             'org.openrewrite.maven:rewrite-maven-plugin:run',
                             f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
                             f'-Drewrite.activeRecipes={recipe}'
-                        ]
+                        ])
 
                         logger.info(f"🔧 Running: {' '.join(cmd)}")
                         result = subprocess.run(
@@ -770,18 +797,40 @@ jobs:
 
                         logger.info(f"OpenRewrite exit code: {result.returncode}")
 
+                        # Always log stdout/stderr at debug level; also show at info when problems are detected
                         if result.stdout:
                             logger.debug(f"OpenRewrite stdout:\n{result.stdout}")
                         if result.stderr:
                             logger.debug(f"OpenRewrite stderr:\n{result.stderr}")
 
-                        # Exit code 0 or 1 both mean success (0=changes made, 1=no changes needed)
+                        # Detect fatal Maven/project-building errors in stderr that indicate OpenRewrite couldn't run
+                        stderr = (result.stderr or '').lower()
+                        fatal_indicators = [
+                            'non-resolvable parent pom',
+                            'could not transfer artifact',
+                            'authorization failed',
+                            '403 forbidden',
+                            '401 unauthorized',
+                            'unresolvablemodelexception',
+                            'projectbuildingexception'
+                        ]
+
+                        if any(ind in stderr for ind in fatal_indicators):
+                            # Log the stderr at info so it's visible in CI logs
+                            logger.info(f"OpenRewrite/Maven stderr:\n{result.stderr}")
+                            logger.warning("⚠️ Maven could not build the project (parent POM or repository auth issue). OpenRewrite did not run.")
+                            return False
+
+                        # Exit code 0 or 1 typically indicate the recipe applied (0) or no changes needed (1)
                         if result.returncode in [0, 1]:
                             logger.info(f"✅ OpenRewrite transformation completed successfully")
                             return True
                         else:
                             logger.warning(f"⚠️ OpenRewrite execution returned status {result.returncode}")
-                            return True
+                            # Show stderr for troubleshooting
+                            if result.stderr:
+                                logger.info(f"OpenRewrite stderr:\n{result.stderr}")
+                            return False
                     except FileNotFoundError:
                         logger.info(f"ℹ️ Maven not available - configuration files will be provided for manual migration")
                         return True
