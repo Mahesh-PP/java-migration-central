@@ -918,12 +918,31 @@ jobs:
                 check=True
             )
 
-            modified_files = [line[3:].strip() for line in result.stdout.split('\n') if line.strip() and line[0] in ['M', 'A', '?']]
+            # Parse porcelain output robustly: paths start at index 3 but may include rename arrows
+            modified_files = []
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.rstrip()
+                if not line:
+                    continue
+                # Defensive: if line is shorter than 3 chars, skip
+                if len(line) < 3:
+                    continue
+                # The path component usually starts at index 3
+                path_part = line[3:].strip()
+                # Handle rename format: "old -> new" -> take the new path
+                if '->' in path_part:
+                    path = path_part.split('->')[-1].strip()
+                else:
+                    path = path_part
+                # Strip surrounding quotes if present
+                if path.startswith('"') and path.endswith('"'):
+                    path = path[1:-1]
+                modified_files.append(path)
 
             logger.info(f"Found {len(modified_files)} modified/new files in git status")
 
             # Also always check for pom.xml and build files that might need to be included
-            always_check_files = ['pom.xml', 'build.gradle', 'build.gradle.kts']
+            always_check_files = ['pom.xml', 'build.gradle', 'build.gradle.kts', 'gradle.properties', 'maven.config']
             for check_file in always_check_files:
                 check_path = repo_path / check_file
                 if check_path.exists() and check_file not in modified_files:
@@ -938,7 +957,7 @@ jobs:
                 # Check if file should be excluded
                 for exclude in exclude_prefixes:
                     if exclude.startswith('.'):
-                        # Exact match for dotfiles
+                        # Exact match for dotfiles/directories
                         if file_path == exclude or file_path.startswith(exclude):
                             should_skip = True
                             skip_reason = f"matches exclude pattern: {exclude}"
@@ -958,11 +977,11 @@ jobs:
 
                 # Additional checks: include only relevant files
                 if not should_skip:
-                    # Include Java source files
-                    if file_path.endswith('.java'):
+                    # Include build config files (pom.xml, build.gradle, etc.) - PRIORITY
+                    if file_path in ['pom.xml', 'build.gradle', 'build.gradle.kts', 'gradle.properties', 'maven.config']:
                         should_skip = False
-                    # Include build config files
-                    elif file_path in ['pom.xml', 'build.gradle', 'build.gradle.kts', 'gradle.properties', 'maven.config']:
+                    # Include Java source files
+                    elif file_path.endswith('.java'):
                         should_skip = False
                     # Include module descriptor
                     elif file_path.endswith('module-info.java'):
@@ -993,8 +1012,23 @@ jobs:
                         capture_output=True,
                         check=True
                     )
-                logger.info(f"✅ Staged {len(files_to_stage)} Java migration files for commit")
-                return True, staged_files
+
+                # After adding, verify what is actually staged
+                staged_proc = subprocess.run(
+                    ['git', '-C', str(repo_path), 'diff', '--cached', '--name-only'],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                actually_staged = [s.strip() for s in staged_proc.stdout.splitlines() if s.strip()]
+
+                if not actually_staged:
+                    logger.warning("⚠️ No files were staged after `git add` - nothing to commit")
+                    return False, []
+
+                logger.info(f"✅ Staged {len(actually_staged)} Java migration files for commit")
+                logger.info(f"   Files staged: {', '.join(actually_staged)}")
+                return True, actually_staged
             else:
                 logger.warning(f"⚠️  No Java migration files to stage - OpenRewrite may not have found changes to make")
                 return False, []
@@ -1008,7 +1042,7 @@ jobs:
     def _check_commits_ahead(self, repo_path: Path, remote: str, branch: str) -> int:
         """Check how many commits the branch is ahead of the base branch.
 
-        Compares the given branch with the upstream tracking branch (origin/branch).
+        Compares the given branch with the default base branch (main/master).
 
         Returns the number of commits ahead, or 0 if equal.
         """
@@ -1016,16 +1050,35 @@ jobs:
             # Fetch latest from origin
             subprocess.run(['git', '-C', str(repo_path), 'fetch', remote], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            # Compare commits
+            # Get the default base branch
+            proc = subprocess.run(
+                ['git', '-C', str(repo_path), 'config', '--get', 'remote.origin.url'],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            origin_url = proc.stdout.decode().strip()
+
+            # For GitHub repos, we can try to get the default branch
+            # but for simplicity, we'll try common defaults
+            base_branch = 'main'
+            for candidate in ['main', 'master', 'develop']:
+                check_result = subprocess.run(
+                    ['git', '-C', str(repo_path), 'rev-parse', f'{remote}/{candidate}'],
+                    capture_output=True
+                )
+                if check_result.returncode == 0:
+                    base_branch = candidate
+                    break
+
+            # Compare commits: how many commits are in branch but NOT in base
             result = subprocess.run(
-                ['git', '-C', str(repo_path), 'rev-list', '--count', f'HEAD..{remote}/{branch}'],
+                ['git', '-C', str(repo_path), 'rev-list', '--count', f'{remote}/{base_branch}..HEAD'],
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
 
             commits_ahead = int(result.stdout.decode().strip())
-            logger.info(f"Branch {branch} is {commits_ahead} commit(s) ahead of {remote}/{branch}")
+            logger.info(f"Branch {branch} is {commits_ahead} commit(s) ahead of {remote}/{base_branch}")
             return commits_ahead
         except Exception as e:
             logger.warning(f"Could not determine commits ahead for {branch}: {e}")
