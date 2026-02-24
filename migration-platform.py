@@ -726,194 +726,267 @@ jobs:
 
 
     def run_openrewrite_migration(self, repo_path: Path, source: str, target: str) -> bool:
-        """Run OpenRewrite to transform Java code and pom.xml
+        """Run OpenRewrite to transform Java code and build files
 
         Returns True to continue (transformation is optional)
         """
         try:
             logger.info(f"Attempting OpenRewrite migration from Java {source} to {target}")
 
+            # Get the OpenRewrite recipe based on version
+            if source == "17" and target == "21":
+                recipe = "org.openrewrite.java.migrate.Java17to21"
+            elif source == "11" and target == "17":
+                recipe = "org.openrewrite.java.migrate.Java11to17"
+            elif source == "8" and target == "11":
+                recipe = "org.openrewrite.java.migrate.Java8to11"
+            elif source == "21" and target == "25":
+                recipe = "org.openrewrite.java.migrate.Java21to25"
+            else:
+                recipe = None
+
+            if not recipe:
+                logger.info(f"No recipe for {source} → {target}")
+                return True
+
             if (repo_path / 'pom.xml').exists():
                 logger.info("Detected Maven project")
 
-                # Get the OpenRewrite recipe based on version
-                if source == "17" and target == "21":
-                    recipe = "org.openrewrite.java.migrate.Java17to21"
-                elif source == "11" and target == "17":
-                    recipe = "org.openrewrite.java.migrate.Java11to17"
-                elif source == "8" and target == "11":
-                    recipe = "org.openrewrite.java.migrate.Java8to11"
-                elif source == "21" and target == "25":
-                    recipe = "org.openrewrite.java.migrate.Java21to25"
-                else:
-                    recipe = None
+                # Try to run Maven with OpenRewrite, but don't fail if it's not available
+                try:
+                    cmd = [
+                        'mvn'
+                    ]
 
-                if recipe:
-                    logger.info(f"Recipe to apply: {recipe}")
-                    # Try to run Maven with OpenRewrite, but don't fail if it's not available
-                    try:
-                        cmd = [
-                            'mvn'
+                    # Allow custom settings.xml to be provided via env
+                    maven_settings_path = None
+
+                    # Priority 1: User provided base64-encoded settings.xml
+                    if os.environ.get('MAVEN_SETTINGS_BASE64'):
+                        import base64, tempfile
+                        encoded = os.environ.get('MAVEN_SETTINGS_BASE64')
+                        try:
+                            data = base64.b64decode(encoded)
+                            tmp_dir = tempfile.mkdtemp(prefix='mvn-settings-')
+                            settings_file = os.path.join(tmp_dir, 'settings.xml')
+                            with open(settings_file, 'wb') as sf:
+                                sf.write(data)
+                            maven_settings_path = settings_file
+                            logger.info(f"Using Maven settings from MAVEN_SETTINGS_BASE64")
+                        except Exception as e:
+                            logger.warning(f"Could not decode MAVEN_SETTINGS_BASE64: {e}")
+
+                    # Priority 2: User provided a path to settings.xml
+                    elif os.environ.get('MAVEN_SETTINGS_PATH'):
+                        maven_settings_path = os.environ.get('MAVEN_SETTINGS_PATH')
+                        logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
+
+                    # Priority 3: Use default ~/.m2/settings.xml if it exists
+                    else:
+                        default_settings = Path.home() / '.m2' / 'settings.xml'
+                        if default_settings.exists():
+                            maven_settings_path = str(default_settings)
+                            logger.info(f"Using default Maven settings: {maven_settings_path}")
+
+                    if maven_settings_path:
+                        cmd.extend(['-s', maven_settings_path])
+
+                    # Add Maven options to handle offline mode and skip repository resolution issues
+                    # This allows OpenRewrite to work even if some repositories are unavailable
+                    cmd.extend([
+                        '-o',  # Offline mode to use local cache only
+                        '-DskipTests',  # Skip tests
+                        '-Dorg.slf4j.simpleLogger.defaultLogLevel=info',  # Control logging
+                    ])
+
+                    # Add the OpenRewrite plugin invocation and recipe flags
+                    cmd.extend([
+                        'org.openrewrite.maven:rewrite-maven-plugin:run',
+                        f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
+                        f'-Drewrite.activeRecipes={recipe}',
+                        '-Drewrite.dryRun=false',  # Ensure changes are written, not just detected
+                        '-Drewrite.failOnDryRunResults=false',  # Don't fail if dry run finds issues
+                    ])
+
+                    logger.info(f"🔧 Running: mvn org.openrewrite.maven:rewrite-maven-plugin:run -Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST -Drewrite.activeRecipes={recipe}")
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(repo_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
+
+                    logger.info(f"OpenRewrite exit code: {result.returncode}")
+
+                    # Log stdout/stderr for debugging
+                    if result.stdout:
+                        logger.debug(f"OpenRewrite stdout:\n{result.stdout}")
+                    if result.stderr:
+                        logger.debug(f"OpenRewrite stderr:\n{result.stderr}")
+
+                    # Detect fatal Maven/project-building errors
+                    stderr_lower = (result.stderr or '').lower()
+                    stdout_lower = (result.stdout or '').lower()
+                    stderr_full = result.stderr or ''
+
+                    fatal_indicators = [
+                        'non-resolvable parent pom',
+                        'could not transfer artifact',
+                        'authorization failed',
+                        '403 forbidden',
+                        '401 unauthorized',
+                        'unresolvablemodelexception',
+                        'projectbuildingexception'
+                    ]
+
+                    has_fatal_error = any(ind in stderr_lower or ind in stdout_lower for ind in fatal_indicators)
+
+                    if has_fatal_error and result.returncode != 0:
+                        logger.warning("⚠️ Maven/OpenRewrite failed due to repository/auth issues")
+                        logger.info(f"Maven error details:\n{stderr_full}")
+                        logger.info("📝 Retrying without offline mode to download dependencies...")
+
+                        # Retry without offline mode to download missing dependencies
+                        cmd_retry = [
+                            'mvn',
                         ]
 
-                        # Allow custom settings.xml to be provided via env
-                        maven_settings_path = None
-
-                        # Priority 1: User provided base64-encoded settings.xml
-                        if os.environ.get('MAVEN_SETTINGS_BASE64'):
-                            import base64, tempfile
-                            encoded = os.environ.get('MAVEN_SETTINGS_BASE64')
-                            try:
-                                data = base64.b64decode(encoded)
-                                tmp_dir = tempfile.mkdtemp(prefix='mvn-settings-')
-                                settings_file = os.path.join(tmp_dir, 'settings.xml')
-                                with open(settings_file, 'wb') as sf:
-                                    sf.write(data)
-                                maven_settings_path = settings_file
-                                logger.info(f"Using Maven settings from MAVEN_SETTINGS_BASE64")
-                            except Exception as e:
-                                logger.warning(f"Could not decode MAVEN_SETTINGS_BASE64: {e}")
-
-                        # Priority 2: User provided a path to settings.xml
-                        elif os.environ.get('MAVEN_SETTINGS_PATH'):
-                            maven_settings_path = os.environ.get('MAVEN_SETTINGS_PATH')
-                            logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
-
-                        # Priority 3: Use default ~/.m2/settings.xml if it exists
-                        else:
-                            default_settings = Path.home() / '.m2' / 'settings.xml'
-                            if default_settings.exists():
-                                maven_settings_path = str(default_settings)
-                                logger.info(f"Using default Maven settings: {maven_settings_path}")
-
                         if maven_settings_path:
-                            cmd.extend(['-s', maven_settings_path])
+                            cmd_retry.extend(['-s', maven_settings_path])
 
-                        # Add Maven options to handle offline mode and skip repository resolution issues
-                        # This allows OpenRewrite to work even if some repositories are unavailable
-                        cmd.extend([
-                            '-o',  # Offline mode to use local cache only
-                            '-DskipTests',  # Skip tests
-                            '-Dorg.slf4j.simpleLogger.defaultLogLevel=info',  # Control logging
-                        ])
-
-                        # Add the OpenRewrite plugin invocation and recipe flags
-                        cmd.extend([
+                        # Remove offline flag and try again
+                        cmd_retry.extend([
+                            '-DskipTests',
+                            '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
                             'org.openrewrite.maven:rewrite-maven-plugin:run',
                             f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
                             f'-Drewrite.activeRecipes={recipe}',
                         ])
 
-                        logger.info(f"🔧 Running: mvn org.openrewrite.maven:rewrite-maven-plugin:run -Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST -Drewrite.activeRecipes={recipe}")
-                        result = subprocess.run(
-                            cmd,
+                        logger.info(f"🔧 Retrying with online mode...")
+                        result_retry = subprocess.run(
+                            cmd_retry,
                             cwd=str(repo_path),
                             capture_output=True,
                             text=True,
                             timeout=300
                         )
 
-                        logger.info(f"OpenRewrite exit code: {result.returncode}")
+                        logger.info(f"OpenRewrite retry exit code: {result_retry.returncode}")
 
-                        # Log stdout/stderr for debugging
-                        if result.stdout:
-                            logger.debug(f"OpenRewrite stdout:\n{result.stdout}")
-                        if result.stderr:
-                            logger.debug(f"OpenRewrite stderr:\n{result.stderr}")
-
-                        # Detect fatal Maven/project-building errors
-                        stderr_lower = (result.stderr or '').lower()
-                        stdout_lower = (result.stdout or '').lower()
-                        stderr_full = result.stderr or ''
-
-                        fatal_indicators = [
-                            'non-resolvable parent pom',
-                            'could not transfer artifact',
-                            'authorization failed',
-                            '403 forbidden',
-                            '401 unauthorized',
-                            'unresolvablemodelexception',
-                            'projectbuildingexception'
-                        ]
-
-                        has_fatal_error = any(ind in stderr_lower or ind in stdout_lower for ind in fatal_indicators)
-
-                        if has_fatal_error and result.returncode != 0:
-                            logger.warning("⚠️ Maven/OpenRewrite failed due to repository/auth issues")
-                            logger.info(f"Maven error details:\n{stderr_full}")
-                            logger.info("📝 Retrying without offline mode to download dependencies...")
-
-                            # Retry without offline mode to download missing dependencies
-                            cmd_retry = [
-                                'mvn',
-                            ]
-
-                            if maven_settings_path:
-                                cmd_retry.extend(['-s', maven_settings_path])
-
-                            # Remove offline flag and try again
-                            cmd_retry.extend([
-                                '-DskipTests',
-                                '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
-                                'org.openrewrite.maven:rewrite-maven-plugin:run',
-                                f'-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
-                                f'-Drewrite.activeRecipes={recipe}',
-                            ])
-
-                            logger.info(f"🔧 Retrying with online mode...")
-                            result_retry = subprocess.run(
-                                cmd_retry,
-                                cwd=str(repo_path),
-                                capture_output=True,
-                                text=True,
-                                timeout=300
-                            )
-
-                            logger.info(f"OpenRewrite retry exit code: {result_retry.returncode}")
-
-                            if result_retry.returncode in [0, 1]:
-                                logger.info(f"✅ OpenRewrite transformation completed on retry")
-                                return True
-                            else:
-                                logger.warning(f"⚠️ OpenRewrite still failed on retry")
-                                if result_retry.stderr:
-                                    logger.info(f"Retry stderr:\n{result_retry.stderr}")
-                                return False
-
-                        # Exit code 0 or 1 typically indicate the recipe applied (0) or no changes needed (1)
-                        if result.returncode in [0, 1]:
-                            logger.info(f"✅ OpenRewrite transformation completed successfully")
-
-                            # Check if pom.xml was actually modified by OpenRewrite
-                            git_status = subprocess.run(
-                                ['git', '-C', str(repo_path), 'status', '--porcelain'],
-                                capture_output=True,
-                                text=True
-                            )
-                            if 'pom.xml' in git_status.stdout:
-                                logger.info(f"✅ pom.xml has been updated by OpenRewrite")
-                            else:
-                                logger.info(f"ℹ️ pom.xml not modified (may already be at target version)")
-
+                        if result_retry.returncode in [0, 1]:
+                            logger.info(f"✅ OpenRewrite transformation completed on retry")
                             return True
                         else:
-                            logger.warning(f"⚠️ OpenRewrite execution returned status {result.returncode}")
-                            if result.stderr:
-                                logger.info(f"OpenRewrite stderr:\n{result.stderr}")
+                            logger.warning(f"⚠️ OpenRewrite still failed on retry")
+                            if result_retry.stderr:
+                                logger.info(f"Retry stderr:\n{result_retry.stderr}")
                             return False
 
-                    except FileNotFoundError:
-                        logger.warning(f"⚠️ Maven not available on system")
-                        logger.info(f"ℹ️ Please install Maven to run OpenRewrite transformations")
+                    # Exit code 0 or 1 typically indicate the recipe applied (0) or no changes needed (1)
+                    if result.returncode in [0, 1]:
+                        logger.info(f"✅ OpenRewrite transformation completed successfully")
+
+                        # Check if pom.xml was actually modified by OpenRewrite
+                        git_status = subprocess.run(
+                            ['git', '-C', str(repo_path), 'status', '--porcelain'],
+                            capture_output=True,
+                            text=True
+                        )
+                        if 'pom.xml' in git_status.stdout:
+                            logger.info(f"✅ pom.xml has been updated by OpenRewrite")
+                        else:
+                            logger.info(f"ℹ️ pom.xml not modified (may already be at target version)")
+
+                        return True
+                    else:
+                        logger.warning(f"⚠️ OpenRewrite execution returned status {result.returncode}")
+                        if result.stderr:
+                            logger.info(f"OpenRewrite stderr:\n{result.stderr}")
                         return False
-                    except subprocess.TimeoutExpired:
-                        logger.warning(f"⚠️ OpenRewrite operation timed out (>300s)")
+
+                except FileNotFoundError:
+                    logger.warning(f"⚠️ Maven not available on system")
+                    logger.info(f"ℹ️ Please install Maven to run OpenRewrite transformations")
+                    return False
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"⚠️ OpenRewrite operation timed out (>300s)")
+                    return False
+            elif (repo_path / 'build.gradle').exists() or (repo_path / 'build.gradle.kts').exists():
+                logger.info("Detected Gradle project")
+
+                # For Gradle, we need to use the OpenRewrite init script
+                import urllib.request
+                import tempfile
+
+                try:
+                    # Download the OpenRewrite init script
+                    init_script_url = "https://raw.githubusercontent.com/openrewrite/rewrite/main/gradle/init.gradle"
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.gradle', delete=False) as init_file:
+                        init_script_path = init_file.name
+                        with urllib.request.urlopen(init_script_url) as response:
+                            init_file.write(response.read().decode('utf-8'))
+
+                    logger.info(f"Downloaded OpenRewrite init script to {init_script_path}")
+
+                    # Run Gradle with OpenRewrite
+                    cmd = [
+                        './gradlew',
+                        '--init-script', init_script_path,
+                        'rewriteRun',
+                        f'-Drewrite.activeRecipes={recipe}',
+                        '-Drewrite.dryRun=false',
+                        '--no-daemon'  # Avoid daemon issues in CI
+                    ]
+
+                    logger.info(f"🔧 Running: ./gradlew --init-script {init_script_path} rewriteRun -Drewrite.activeRecipes={recipe}")
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(repo_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=600  # Gradle might take longer
+                    )
+
+                    logger.info(f"OpenRewrite Gradle exit code: {result.returncode}")
+
+                    # Log stdout/stderr for debugging
+                    if result.stdout:
+                        logger.debug(f"OpenRewrite Gradle stdout:\n{result.stdout}")
+                    if result.stderr:
+                        logger.debug(f"OpenRewrite Gradle stderr:\n{result.stderr}")
+
+                    # Clean up init script
+                    os.unlink(init_script_path)
+
+                    # Exit code 0 or 1 typically indicate success
+                    if result.returncode in [0, 1]:
+                        logger.info(f"✅ OpenRewrite Gradle transformation completed")
+
+                        # Check if build.gradle was modified
+                        git_status = subprocess.run(
+                            ['git', '-C', str(repo_path), 'status', '--porcelain'],
+                            capture_output=True,
+                            text=True
+                        )
+                        if 'build.gradle' in git_status.stdout or 'build.gradle.kts' in git_status.stdout:
+                            logger.info(f"✅ Build file has been updated by OpenRewrite")
+                        else:
+                            logger.info(f"ℹ️ Build file not modified (may already be at target version)")
+
+                        return True
+                    else:
+                        logger.warning(f"⚠️ OpenRewrite Gradle failed with exit code {result.returncode}")
+                        if result.stderr:
+                            logger.info(f"Gradle stderr:\n{result.stderr}")
                         return False
-                else:
-                    logger.info(f"No recipe for {source} → {target}")
-                    return True
+
+                except Exception as e:
+                    logger.warning(f"⚠️ Gradle OpenRewrite setup failed: {e}")
+                    return False
             else:
-                logger.info("No pom.xml found - skipping OpenRewrite (Gradle projects require manual setup)")
+                logger.info("No pom.xml or build.gradle found - skipping OpenRewrite")
                 return True
 
         except Exception as e:
