@@ -48,13 +48,8 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
-          cache: 'maven'
 
-      # ── Maven must be on PATH so the plugin can be invoked ────────────────
-      - name: Set up Maven
-        uses: stCarolas/setup-maven@v5
-        with:
-          maven-version: '3.9.6'
+      # ubuntu-latest already ships with Maven 3.9.x — no extra setup needed.
 
       - name: Set up Python
         uses: actions/setup-python@v5
