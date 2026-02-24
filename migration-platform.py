@@ -715,37 +715,30 @@ jobs:
 
 
     def run_openrewrite_migration(self, repo_path: Path, source: str, target: str) -> bool:
-        """Run OpenRewrite to transform Java source code and pom.xml/build files.
-
-        Strategy (Maven):
-          - Always run in ONLINE mode so CI can download the plugin and recipe jars.
-          - Always pass -Drewrite.dryRun=false so changes are actually written to disk.
-          - Log full stdout/stderr at INFO so every run is debuggable.
-
+        """Run OpenRewrite to transform Java source code and build files.
         Returns True when OpenRewrite ran (even if no changes were needed).
-        Returns False only on a hard error (Maven not found, build explosion, timeout).
+        Returns False only on a hard error.
         """
         try:
             logger.info(f"Attempting OpenRewrite migration from Java {source} to {target}")
 
-            # ── Resolve recipe ──────────────────────────────────────────────────
+            # ── Correct recipe names verified against rewrite-migrate-java ──────
+            # https://docs.openrewrite.org/recipes/java/migrate/
             recipe_map = {
-                ("8",  "11"): "org.openrewrite.java.migrate.Java8to11",
-                ("11", "17"): "org.openrewrite.java.migrate.Java11to17",
-                ("17", "21"): "org.openrewrite.java.migrate.Java17to21",
-                ("21", "25"): "org.openrewrite.java.migrate.Java21to25",
+                ("8",  "11"): "org.openrewrite.java.migrate.Java8toJava11",
+                ("11", "17"): "org.openrewrite.java.migrate.Java11toJava17",
+                ("17", "21"): "org.openrewrite.java.migrate.UpgradeToJava21",
+                ("21", "25"): "org.openrewrite.java.migrate.UpgradeToJava25",
             }
             recipe = recipe_map.get((source, target))
             if not recipe:
                 logger.info(f"No OpenRewrite recipe defined for {source} → {target}, skipping")
                 return True
 
-            # ── Maven project ───────────────────────────────────────────────────
             if (repo_path / 'pom.xml').exists():
                 logger.info("Detected Maven project")
-                return self._run_openrewrite_maven(repo_path, recipe, source, target)
+                return self._run_openrewrite_maven(repo_path, recipe)
 
-            # ── Gradle project ──────────────────────────────────────────────────
             if (repo_path / 'build.gradle').exists() or (repo_path / 'build.gradle.kts').exists():
                 logger.info("Detected Gradle project")
                 return self._run_openrewrite_gradle(repo_path, recipe)
@@ -759,11 +752,18 @@ jobs:
             logger.debug(traceback.format_exc())
             return False
 
-    def _run_openrewrite_maven(self, repo_path: Path, recipe: str, source: str, target: str) -> bool:
-        """Execute OpenRewrite via Maven in ONLINE mode (writes changes to disk)."""
+    def _run_openrewrite_maven(self, repo_path: Path, recipe: str) -> bool:
+        """Execute OpenRewrite via Maven ONLINE mode — always writes changes to disk."""
         import tempfile, base64
 
-        # ── Locate settings.xml ──────────────────────────────────────────
+        # ── settings.xml resolution ───────────────────────────────────────
+        # IMPORTANT: actions/setup-java@v4 writes a settings.xml that points
+        # to GitHub Packages.  Using it for the TARGET repo causes Maven to
+        # try to authenticate against GitHub Packages instead of Maven Central,
+        # breaking the OpenRewrite plugin download.
+        # We therefore ONLY use a custom settings.xml when one is explicitly
+        # provided by the user; we never fall back to ~/.m2/settings.xml that
+        # was injected by CI.
         maven_settings_path = None
         if os.environ.get('MAVEN_SETTINGS_BASE64'):
             try:
@@ -780,12 +780,11 @@ jobs:
             maven_settings_path = os.environ['MAVEN_SETTINGS_PATH']
             logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
         else:
-            default_settings = Path.home() / '.m2' / 'settings.xml'
-            if default_settings.exists():
-                maven_settings_path = str(default_settings)
-                logger.info(f"Using default Maven settings: {maven_settings_path}")
+            # Explicitly skip ~/.m2/settings.xml — it may have been written by
+            # actions/setup-java and would redirect Maven to GitHub Packages.
+            logger.info("No custom Maven settings provided — using Maven Central defaults")
 
-        # ── Build command (ONLINE — no -o flag) ──────────────────────────
+        # ── Build the mvn command ─────────────────────────────────────────
         cmd = ['mvn', '--batch-mode']
         if maven_settings_path:
             cmd.extend(['-s', maven_settings_path])
@@ -795,11 +794,11 @@ jobs:
             'org.openrewrite.maven:rewrite-maven-plugin:run',
             '-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
             f'-Drewrite.activeRecipes={recipe}',
-            '-Drewrite.dryRun=false',            # ← MUST be false to write changes
+            '-Drewrite.dryRun=false',
             '-Drewrite.failOnDryRunResults=false',
         ])
 
-        logger.info(f"🔧 Running OpenRewrite (Maven): {' '.join(cmd[-5:])}")
+        logger.info(f"🔧 Running OpenRewrite (Maven) recipe: {recipe}")
         try:
             result = subprocess.run(
                 cmd,
@@ -815,33 +814,48 @@ jobs:
             logger.warning("⚠️ OpenRewrite timed out after 600 s")
             return False
 
-        # ── Log full output so the run is always debuggable ──────────────
+        # ── Always log full output for debugging ─────────────────────────
         logger.info(f"OpenRewrite exit code: {result.returncode}")
-        if result.stdout and result.stdout.strip():
-            logger.info(f"OpenRewrite stdout:\n{result.stdout.strip()}")
-        if result.stderr and result.stderr.strip():
-            logger.info(f"OpenRewrite stderr:\n{result.stderr.strip()}")
+        combined_output = (result.stdout or '') + (result.stderr or '')
+        if combined_output.strip():
+            logger.info(f"OpenRewrite output:\n{combined_output.strip()}")
 
-        # ── Interpret result ──────────────────────────────────────────────
-        # Maven/OpenRewrite exit codes:
-        #   0 = success, changes were written
-        #   1 = build error  (but can also mean "recipe ran, no changes needed"
-        #       when the plugin exits with 1 after a successful dry-run pass)
-        # We treat 0 or 1 as "ran OK"; anything else is a hard failure.
+        # ── Detect hard plugin/recipe errors even when exit code is 0/1 ──
+        # e.g. "Recipe(s) not found: org.openrewrite.java.migrate.Java17to21"
+        error_indicators = [
+            'recipe(s) not found',
+            'failed to execute goal',
+            'could not resolve dependencies',
+            'non-resolvable parent pom',
+            'pluginexecutionexception',
+            'could not transfer artifact',
+        ]
+        output_lower = combined_output.lower()
+        has_plugin_error = any(e in output_lower for e in error_indicators)
+
+        if has_plugin_error:
+            logger.error(f"❌ OpenRewrite plugin error detected in output — recipe did not run")
+            logger.error(f"   Hint: check that the recipe name is correct for the installed version of rewrite-migrate-java")
+            return False
+
         if result.returncode not in (0, 1):
             logger.warning(f"⚠️ OpenRewrite exited with code {result.returncode} — treating as failure")
             return False
 
-        # Report whether files were actually changed
+        # ── Report only SOURCE files changed (exclude target/ build output) ─
         git_st = subprocess.run(
             ['git', '-C', str(repo_path), 'status', '--porcelain'],
             capture_output=True, text=True
         )
-        changed = [l[3:].strip() for l in git_st.stdout.splitlines() if l.strip()]
+        changed = [
+            line[3:].strip()
+            for line in git_st.stdout.splitlines()
+            if line.strip() and not line[3:].strip().startswith('target/')
+        ]
         if changed:
-            logger.info(f"✅ OpenRewrite modified {len(changed)} file(s): {', '.join(changed[:10])}")
+            logger.info(f"✅ OpenRewrite modified {len(changed)} source file(s): {', '.join(changed[:10])}")
         else:
-            logger.info("ℹ️  OpenRewrite ran but made no file changes (repo may already be up to date)")
+            logger.info("ℹ️  OpenRewrite ran but made no source file changes (repo may already be up to date)")
 
         return True
 
@@ -857,7 +871,7 @@ jobs:
                 init_script_path = f.name
                 with urllib.request.urlopen(init_script_url) as resp:
                     f.write(resp.read().decode('utf-8'))
-            logger.info(f"Downloaded OpenRewrite Gradle init script")
+            logger.info("Downloaded OpenRewrite Gradle init script")
 
             gradlew = './gradlew' if (repo_path / 'gradlew').exists() else 'gradle'
             cmd = [
@@ -868,18 +882,17 @@ jobs:
                 f'-Drewrite.activeRecipes={recipe}',
                 '-Drewrite.dryRun=false',
             ]
-            logger.info(f"🔧 Running OpenRewrite (Gradle): rewriteRun -Drewrite.activeRecipes={recipe}")
+            logger.info(f"🔧 Running OpenRewrite (Gradle) recipe: {recipe}")
             result = subprocess.run(
                 cmd, cwd=str(repo_path),
                 capture_output=True, text=True, timeout=600
             )
             os.unlink(init_script_path)
 
+            combined_output = (result.stdout or '') + (result.stderr or '')
             logger.info(f"OpenRewrite Gradle exit code: {result.returncode}")
-            if result.stdout and result.stdout.strip():
-                logger.info(f"Gradle stdout:\n{result.stdout.strip()}")
-            if result.stderr and result.stderr.strip():
-                logger.info(f"Gradle stderr:\n{result.stderr.strip()}")
+            if combined_output.strip():
+                logger.info(f"OpenRewrite Gradle output:\n{combined_output.strip()}")
 
             if result.returncode not in (0, 1):
                 logger.warning(f"⚠️ OpenRewrite Gradle exited with code {result.returncode}")
@@ -889,11 +902,15 @@ jobs:
                 ['git', '-C', str(repo_path), 'status', '--porcelain'],
                 capture_output=True, text=True
             )
-            changed = [l[3:].strip() for l in git_st.stdout.splitlines() if l.strip()]
+            changed = [
+                line[3:].strip()
+                for line in git_st.stdout.splitlines()
+                if line.strip() and not line[3:].strip().startswith('build/')
+            ]
             if changed:
-                logger.info(f"✅ OpenRewrite modified {len(changed)} file(s)")
+                logger.info(f"✅ OpenRewrite modified {len(changed)} source file(s)")
             else:
-                logger.info("ℹ️  OpenRewrite ran but made no file changes")
+                logger.info("ℹ️  OpenRewrite ran but made no source file changes")
             return True
 
         except Exception as e:

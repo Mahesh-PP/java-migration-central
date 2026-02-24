@@ -94,6 +94,18 @@ jobs:
           git   --version
           echo "──────────────────────────────────────"
 
+      # actions/setup-java@v4 writes a settings.xml that redirects Maven to
+      # GitHub Packages (server-id: github).  If this file is present when
+      # OpenRewrite runs against the TARGET repo it will try to authenticate
+      # against GitHub Packages instead of Maven Central and the plugin
+      # download will fail.  Remove it so Maven uses its built-in defaults.
+      - name: Remove CI-injected Maven settings.xml
+        run: |
+          if [ -f "$HOME/.m2/settings.xml" ]; then
+            echo "Removing CI-generated ~/.m2/settings.xml (pointed at GitHub Packages)"
+            rm "$HOME/.m2/settings.xml"
+          fi
+
       - name: Run Java migration (OpenRewrite + PR)
         env:
           GITHUB_TOKEN: ${{ env.GITHUB_TOKEN }}
