@@ -729,9 +729,12 @@ jobs:
             #               (LATEST resolves to the newest published version)
             #
             # Jakarta EE note:
-            #   javax.* → jakarta.* is handled by JakartaEE10Migration which lives
-            #   in rewrite-migrate-java (>=2.x).  The UpgradeToJava21 composite
-            #   recipe does NOT include it — it must be listed explicitly.
+            #   javax.* → jakarta.* is handled by:
+            #     - org.openrewrite.java.migrate.jakarta.JakartaEE9  (Java 8/11 → 11/17)
+            #     - org.openrewrite.java.migrate.jakarta.JakartaEE10 (Java 17 → 21)
+            #   NOTE: The recipe name is "JakartaEE10" NOT "JakartaEE10Migration".
+            #   The UpgradeToJava21 composite recipe does NOT include it — must be
+            #   listed explicitly.
             #
             # Spring Boot note:
             #   Spring Boot 3.x requires Jakarta EE 10.  If the project uses
@@ -742,7 +745,7 @@ jobs:
                 ("8", "11"): {
                     "recipes": ",".join([
                         "org.openrewrite.java.migrate.Java8toJava11",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE9Migration",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE9",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -751,7 +754,7 @@ jobs:
                 ("11", "17"): {
                     "recipes": ",".join([
                         "org.openrewrite.java.migrate.Java11toJava17",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE9Migration",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE9",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -759,10 +762,11 @@ jobs:
                 },
                 ("17", "21"): {
                     "recipes": ",".join([
-                        # Core Java 21 upgrade (compiler version, API changes)
+                        # Core Java 21 upgrade (compiler version, sequenced collections, API changes)
                         "org.openrewrite.java.migrate.UpgradeToJava21",
-                        # javax.* → jakarta.* (JakartaEE 10)
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE10Migration",
+                        # javax.* → jakarta.* (Jakarta EE 10)
+                        # Correct name is "JakartaEE10", NOT "JakartaEE10Migration"
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE10",
                         # Spring Boot 2.x → 3.2 (requires Jakarta EE 10)
                         "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_2",
                     ]),
@@ -774,7 +778,7 @@ jobs:
                 ("21", "25"): {
                     "recipes": ",".join([
                         "org.openrewrite.java.migrate.UpgradeToJava25",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE11Migration",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE11",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
