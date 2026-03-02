@@ -722,26 +722,84 @@ jobs:
         try:
             logger.info(f"Attempting OpenRewrite migration from Java {source} to {target}")
 
-            # ── Correct recipe names verified against rewrite-migrate-java ──────
-            # https://docs.openrewrite.org/recipes/java/migrate/
-            recipe_map = {
-                ("8",  "11"): "org.openrewrite.java.migrate.Java8toJava11",
-                ("11", "17"): "org.openrewrite.java.migrate.Java11toJava17",
-                ("17", "21"): "org.openrewrite.java.migrate.UpgradeToJava21",
-                ("21", "25"): "org.openrewrite.java.migrate.UpgradeToJava25",
+            # ── Migration config: recipes + artifact coordinates ────────────────
+            # Each entry defines:
+            #   recipes   : comma-separated list of active recipes
+            #   artifacts : comma-separated list of Maven GAV coords for recipe jars
+            #               (LATEST resolves to the newest published version)
+            #
+            # Jakarta EE note:
+            #   javax.* → jakarta.* is handled by JakartaEE10Migration which lives
+            #   in rewrite-migrate-java (>=2.x).  The UpgradeToJava21 composite
+            #   recipe does NOT include it — it must be listed explicitly.
+            #
+            # Spring Boot note:
+            #   Spring Boot 3.x requires Jakarta EE 10.  If the project uses
+            #   Spring Boot 2.x, UpgradeSpringBoot_3_2 will also update
+            #   pom.xml parent / dependencies to Spring Boot 3.2.
+            #   rewrite-spring artifact is required for Spring Boot recipes.
+            migration_config = {
+                ("8", "11"): {
+                    "recipes": ",".join([
+                        "org.openrewrite.java.migrate.Java8toJava11",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE9Migration",
+                    ]),
+                    "artifacts": ",".join([
+                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
+                    ]),
+                },
+                ("11", "17"): {
+                    "recipes": ",".join([
+                        "org.openrewrite.java.migrate.Java11toJava17",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE9Migration",
+                    ]),
+                    "artifacts": ",".join([
+                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
+                    ]),
+                },
+                ("17", "21"): {
+                    "recipes": ",".join([
+                        # Core Java 21 upgrade (compiler version, API changes)
+                        "org.openrewrite.java.migrate.UpgradeToJava21",
+                        # javax.* → jakarta.* (JakartaEE 10)
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE10Migration",
+                        # Spring Boot 2.x → 3.2 (requires Jakarta EE 10)
+                        "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_2",
+                    ]),
+                    "artifacts": ",".join([
+                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
+                        "org.openrewrite.recipe:rewrite-spring:LATEST",
+                    ]),
+                },
+                ("21", "25"): {
+                    "recipes": ",".join([
+                        "org.openrewrite.java.migrate.UpgradeToJava25",
+                        "org.openrewrite.java.migrate.jakarta.JakartaEE11Migration",
+                    ]),
+                    "artifacts": ",".join([
+                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
+                    ]),
+                },
             }
-            recipe = recipe_map.get((source, target))
-            if not recipe:
+
+            config = migration_config.get((source, target))
+            if not config:
                 logger.info(f"No OpenRewrite recipe defined for {source} → {target}, skipping")
                 return True
 
+            recipes   = config["recipes"]
+            artifacts = config["artifacts"]
+
+            logger.info(f"Recipes   : {recipes}")
+            logger.info(f"Artifacts : {artifacts}")
+
             if (repo_path / 'pom.xml').exists():
                 logger.info("Detected Maven project")
-                return self._run_openrewrite_maven(repo_path, recipe)
+                return self._run_openrewrite_maven(repo_path, recipes, artifacts)
 
             if (repo_path / 'build.gradle').exists() or (repo_path / 'build.gradle.kts').exists():
                 logger.info("Detected Gradle project")
-                return self._run_openrewrite_gradle(repo_path, recipe)
+                return self._run_openrewrite_gradle(repo_path, recipes)
 
             logger.info("No pom.xml or build.gradle found — skipping OpenRewrite")
             return True
@@ -752,13 +810,13 @@ jobs:
             logger.debug(traceback.format_exc())
             return False
 
-    def _run_openrewrite_maven(self, repo_path: Path, recipe: str) -> bool:
+    def _run_openrewrite_maven(self, repo_path: Path, recipes: str, artifacts: str) -> bool:
         """Execute OpenRewrite via Maven ONLINE mode — always writes changes to disk."""
         import tempfile, base64
 
         # ── settings.xml resolution ───────────────────────────────────────
         # IMPORTANT: actions/setup-java@v4 writes a settings.xml that points
-        # to GitHub Packages.  Using it for the TARGET repo causes Maven to
+        # to GitHub Packages. Using it for the TARGET repo causes Maven to
         # try to authenticate against GitHub Packages instead of Maven Central,
         # breaking the OpenRewrite plugin download.
         # We therefore ONLY use a custom settings.xml when one is explicitly
@@ -780,8 +838,6 @@ jobs:
             maven_settings_path = os.environ['MAVEN_SETTINGS_PATH']
             logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
         else:
-            # Explicitly skip ~/.m2/settings.xml — it may have been written by
-            # actions/setup-java and would redirect Maven to GitHub Packages.
             logger.info("No custom Maven settings provided — using Maven Central defaults")
 
         # ── Build the mvn command ─────────────────────────────────────────
@@ -792,13 +848,15 @@ jobs:
             '-DskipTests',
             '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
             'org.openrewrite.maven:rewrite-maven-plugin:run',
-            '-Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:LATEST',
-            f'-Drewrite.activeRecipes={recipe}',
+            f'-Drewrite.recipeArtifactCoordinates={artifacts}',
+            f'-Drewrite.activeRecipes={recipes}',
             '-Drewrite.dryRun=false',
             '-Drewrite.failOnDryRunResults=false',
         ])
 
-        logger.info(f"🔧 Running OpenRewrite (Maven) recipe: {recipe}")
+        logger.info(f"🔧 Running OpenRewrite (Maven)")
+        logger.info(f"   Recipes   : {recipes}")
+        logger.info(f"   Artifacts : {artifacts}")
         try:
             result = subprocess.run(
                 cmd,
@@ -821,7 +879,6 @@ jobs:
             logger.info(f"OpenRewrite output:\n{combined_output.strip()}")
 
         # ── Detect hard plugin/recipe errors even when exit code is 0/1 ──
-        # e.g. "Recipe(s) not found: org.openrewrite.java.migrate.Java17to21"
         error_indicators = [
             'recipe(s) not found',
             'failed to execute goal',
@@ -835,7 +892,7 @@ jobs:
 
         if has_plugin_error:
             logger.error(f"❌ OpenRewrite plugin error detected in output — recipe did not run")
-            logger.error(f"   Hint: check that the recipe name is correct for the installed version of rewrite-migrate-java")
+            logger.error(f"   Full output above for details")
             return False
 
         if result.returncode not in (0, 1):
