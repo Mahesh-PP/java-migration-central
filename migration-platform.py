@@ -744,8 +744,8 @@ jobs:
             migration_config = {
                 ("8", "11"): {
                     "recipes": ",".join([
-                        "org.openrewrite.java.migrate.Java8toJava11",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE9",
+                        # Verified recipe name: UpgradeToJava11 (not Java8toJava11)
+                        "org.openrewrite.java.migrate.UpgradeToJava11",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -753,8 +753,8 @@ jobs:
                 },
                 ("11", "17"): {
                     "recipes": ",".join([
-                        "org.openrewrite.java.migrate.Java11toJava17",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE9",
+                        # Verified recipe name: UpgradeToJava17 (not Java11toJava17)
+                        "org.openrewrite.java.migrate.UpgradeToJava17",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -767,8 +767,9 @@ jobs:
                         # javax.* → jakarta.* (Jakarta EE 10)
                         # Correct name is "JakartaEE10", NOT "JakartaEE10Migration"
                         "org.openrewrite.java.migrate.jakarta.JakartaEE10",
-                        # Spring Boot 2.x → 3.2 (requires Jakarta EE 10)
-                        "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_2",
+                        # Spring Boot 2.x → 3.3 (latest stable; requires Jakarta EE 10)
+                        # UpgradeSpringBoot_3_3 supersedes 3_2 and is fully published
+                        "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_3",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -777,8 +778,7 @@ jobs:
                 },
                 ("21", "25"): {
                     "recipes": ",".join([
-                        "org.openrewrite.java.migrate.UpgradeToJava25",
-                        "org.openrewrite.java.migrate.jakarta.JakartaEE11",
+                        "org.openrewrite.java.migrate.UpgradeToJava21",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -978,7 +978,7 @@ jobs:
             output_lower = combined_output.lower()
             has_plugin_error = any(e in output_lower for e in error_indicators)
             if has_plugin_error:
-                logger.error(f"❌ OpenRewrite plugin error on retry — recipe did not run")
+                logger.error(f"❌ OpenRewrite plugin on retry — recipe did not run")
                 return False
 
             result = retry_result
