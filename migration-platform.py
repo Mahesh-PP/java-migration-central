@@ -722,54 +722,33 @@ jobs:
         try:
             logger.info(f"Attempting OpenRewrite migration from Java {source} to {target}")
 
-            # ── Migration config: recipes + artifact coordinates ────────────────
+            # ── Migration config: recipes + artifact coordinates ─────────────────
             # Each entry defines:
             #   recipes   : comma-separated list of active recipes
             #   artifacts : comma-separated list of Maven GAV coords for recipe jars
-            #               (LATEST resolves to the newest published version)
             #
-            # Jakarta EE note:
-            #   javax.* → jakarta.* is handled by:
-            #     - org.openrewrite.java.migrate.jakarta.JakartaEE9  (Java 8/11 → 11/17)
-            #     - org.openrewrite.java.migrate.jakarta.JakartaEE10 (Java 17 → 21)
-            #   NOTE: The recipe name is "JakartaEE10" NOT "JakartaEE10Migration".
-            #   The UpgradeToJava21 composite recipe does NOT include it — must be
-            #   listed explicitly.
-            #
-            # Spring Boot note:
-            #   Spring Boot 3.x requires Jakarta EE 10.  If the project uses
-            #   Spring Boot 2.x, UpgradeSpringBoot_3_2 will also update
-            #   pom.xml parent / dependencies to Spring Boot 3.2.
-            #   rewrite-spring artifact is required for Spring Boot recipes.
+            # NOTE on availability:
+            # OpenRewrite recipe IDs can change over time. We keep these aligned
+            # to what the Maven plugin reports in its "Did you mean" suggestions.
             migration_config = {
                 ("8", "11"): {
-                    "recipes": ",".join([
-                        # Verified recipe name: UpgradeToJava11 (not Java8toJava11)
-                        "org.openrewrite.java.migrate.UpgradeToJava11",
-                    ]),
-                    "artifacts": ",".join([
-                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
-                    ]),
+                    "recipes": "org.openrewrite.java.migrate.UpgradeToJava11",
+                    "artifacts": "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
                 },
                 ("11", "17"): {
-                    "recipes": ",".join([
-                        # Verified recipe name: UpgradeToJava17 (not Java11toJava17)
-                        "org.openrewrite.java.migrate.UpgradeToJava17",
-                    ]),
-                    "artifacts": ",".join([
-                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
-                    ]),
+                    "recipes": "org.openrewrite.java.migrate.UpgradeToJava17",
+                    "artifacts": "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
                 },
                 ("17", "21"): {
                     "recipes": ",".join([
-                        # Core Java 21 upgrade (compiler version, sequenced collections, API changes)
+                        # Core Java 21 upgrade
                         "org.openrewrite.java.migrate.UpgradeToJava21",
                         # javax.* → jakarta.* (Jakarta EE 10)
-                        # Correct name is "JakartaEE10", NOT "JakartaEE10Migration"
+                        # Correct recipe id is JakartaEE10 (NOT JakartaEE10Migration / JakartaEE9, etc.)
                         "org.openrewrite.java.migrate.jakarta.JakartaEE10",
-                        # Spring Boot 2.x → 3.3 (latest stable; requires Jakarta EE 10)
-                        # UpgradeSpringBoot_3_3 supersedes 3_2 and is fully published
-                        "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_3",
+                        # Spring Boot (optional but recommended for Boot apps)
+                        # Use 3_2 as it is widely available in rewrite-spring.
+                        "org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_2",
                     ]),
                     "artifacts": ",".join([
                         "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
@@ -777,12 +756,8 @@ jobs:
                     ]),
                 },
                 ("21", "25"): {
-                    "recipes": ",".join([
-                        "org.openrewrite.java.migrate.UpgradeToJava21",
-                    ]),
-                    "artifacts": ",".join([
-                        "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
-                    ]),
+                    "recipes": "org.openrewrite.java.migrate.UpgradeToJava25",
+                    "artifacts": "org.openrewrite.recipe:rewrite-migrate-java:LATEST",
                 },
             }
 
@@ -791,7 +766,7 @@ jobs:
                 logger.info(f"No OpenRewrite recipe defined for {source} → {target}, skipping")
                 return True
 
-            recipes   = config["recipes"]
+            recipes = config["recipes"]
             artifacts = config["artifacts"]
 
             logger.info(f"Recipes   : {recipes}")
@@ -803,7 +778,10 @@ jobs:
 
             if (repo_path / 'build.gradle').exists() or (repo_path / 'build.gradle.kts').exists():
                 logger.info("Detected Gradle project")
-                return self._run_openrewrite_gradle(repo_path, recipes)
+                # For Gradle we currently only support a single recipe string.
+                # Use the first recipe in the list.
+                first_recipe = recipes.split(',')[0].strip() if recipes else recipes
+                return self._run_openrewrite_gradle(repo_path, first_recipe)
 
             logger.info("No pom.xml or build.gradle found — skipping OpenRewrite")
             return True
@@ -835,7 +813,53 @@ jobs:
             maven_settings_path = os.environ['MAVEN_SETTINGS_PATH']
             logger.info(f"Using Maven settings from MAVEN_SETTINGS_PATH: {maven_settings_path}")
         else:
-            logger.info("No custom Maven settings provided — using Maven Central defaults")
+            # In CI/corporate environments, a user's global ~/.m2/settings.xml may
+            # point at a private mirror that blocks access (403/401) to OpenRewrite
+            # artifacts. To make migrations reproducible, generate an isolated
+            # settings.xml that uses Maven Central directly.
+            logger.info("No custom Maven settings provided — generating isolated Maven Central settings.xml")
+            tmp_dir = tempfile.mkdtemp(prefix='mvn-central-')
+            settings_file = os.path.join(tmp_dir, 'settings.xml')
+            settings_xml = """<settings xmlns=\"http://maven.apache.org/SETTINGS/1.0.0\"
+    xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"
+    xsi:schemaLocation=\"http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd\">
+  <mirrors>
+    <mirror>
+      <id>central</id>
+      <name>Maven Central</name>
+      <url>https://repo1.maven.org/maven2</url>
+      <mirrorOf>central</mirrorOf>
+    </mirror>
+  </mirrors>
+  <profiles>
+    <profile>
+      <id>central</id>
+      <repositories>
+        <repository>
+          <id>central</id>
+          <url>https://repo1.maven.org/maven2</url>
+          <releases><enabled>true</enabled></releases>
+          <snapshots><enabled>false</enabled></snapshots>
+        </repository>
+      </repositories>
+      <pluginRepositories>
+        <pluginRepository>
+          <id>central</id>
+          <url>https://repo1.maven.org/maven2</url>
+          <releases><enabled>true</enabled></releases>
+          <snapshots><enabled>false</enabled></snapshots>
+        </pluginRepository>
+      </pluginRepositories>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>central</activeProfile>
+  </activeProfiles>
+</settings>
+"""
+            with open(settings_file, 'w', encoding='utf-8') as sf:
+                sf.write(settings_xml)
+            maven_settings_path = settings_file
 
         def build_cmd(extra_flags: list = None) -> list:
             """Build the mvn command, optionally injecting extra flags."""
@@ -843,16 +867,15 @@ jobs:
             if maven_settings_path:
                 c.extend(['-s', maven_settings_path])
             c.extend([
-                # Skip test compilation AND test execution so that
-                # pre-existing compilation errors in test classes (caused by
-                # a partial previous migration) do not block OpenRewrite from
-                # running on the main sources.
-                '-DskipTests',
+                # Important: the OpenRewrite Maven plugin may invoke parts of the
+                # build lifecycle depending on project setup. To ensure OpenRewrite
+                # can run even when tests are currently broken (common during
+                # Spring Boot/Jakarta upgrades), skip both *execution* and
+                # *compilation* of tests.
                 '-Dmaven.test.skip=true',
-                # Do NOT hard-fail if some compiler errors remain in test scope;
-                # OpenRewrite patches the code, so errors may disappear after it runs.
+                '-DskipTests',
+                # Avoid failing the mojo if source compilation isn’t clean yet.
                 '-Dmaven.compiler.failOnError=false',
-                # Continue building other modules even if one fails (multi-module).
                 '--fail-at-end',
                 '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
                 'org.openrewrite.maven:rewrite-maven-plugin:run',
@@ -896,13 +919,57 @@ jobs:
         if combined_output.strip():
             logger.info(f"OpenRewrite output:\n{combined_output.strip()}")
 
-        # ── Detect hard plugin/recipe errors even when exit code is 0/1 ──
-        # NOTE: 'compilation error' is intentionally included here because
-        # Maven may emit it when the project has pre-existing broken imports
-        # introduced by a previous partial migration attempt.  In that case
-        # we retry with -Dmaven.compiler.failOnError=false already set but
-        # we also force OpenRewrite to use --no-transfer-progress and the
-        # rewrite:run goal explicitly so it skips the compile phase entirely.
+        def _autofix_recipes_from_output(output: str, current_recipes: str) -> Optional[str]:
+            """If Maven says 'Recipe(s) not found' and prints 'Did you mean' suggestions,
+            replace unknown recipes with the suggested one(s).
+
+            Returns a new recipes string or None if no fix is possible.
+            """
+            if not output:
+                return None
+            low = output.lower()
+            if 'recipe(s) not found' not in low or 'did you mean' not in low:
+                return None
+
+            # Collect suggestions like:
+            #   Error: Did you mean: org.openrewrite.java.migrate.jakarta.JakartaEE10
+            suggestions = []
+            for line in output.splitlines():
+                l = line.strip()
+                if 'did you mean' in l.lower():
+                    # Next token(s) might live on same line after ':'
+                    parts = l.split(':', 1)
+                    if len(parts) == 2 and parts[1].strip():
+                        suggestions.extend([s.strip() for s in parts[1].split(',') if s.strip()])
+                    continue
+                # Some Maven outputs use 'Error: -> ' lines; take fully-qualified recipe IDs.
+                if l.startswith('Error:'):
+                    token = l.replace('Error:', '').strip()
+                    if token.startswith('org.openrewrite.'):
+                        suggestions.append(token)
+
+            suggestions = [s for s in suggestions if s.startswith('org.openrewrite.')]
+            if not suggestions:
+                return None
+
+            fixed = []
+            for r in [x.strip() for x in (current_recipes or '').split(',') if x.strip()]:
+                # If this exact recipe is mentioned as missing, swap to first suggestion.
+                # We keep ordering stable.
+                if r not in suggestions and any(r.split('.')[-1] in s for s in suggestions):
+                    fixed.append(suggestions[0])
+                else:
+                    fixed.append(r)
+
+            # If nothing changed, just append suggestion(s) (best-effort)
+            if ','.join(fixed) == current_recipes:
+                for s in suggestions:
+                    if s not in fixed:
+                        fixed.append(s)
+
+            return ','.join(fixed)
+
+        # ── Detect hard plugin/recipe errors even when exit code is 0/1 ─────────
         error_indicators = [
             'recipe(s) not found',
             'failed to execute goal',
@@ -910,79 +977,71 @@ jobs:
             'non-resolvable parent pom',
             'pluginexecutionexception',
             'could not transfer artifact',
-        ]
-        # Compilation errors are handled separately with a retry strategy
-        compilation_error_indicators = [
-            'compilation error',
-            'cannot find symbol',
-            'package does not exist',
+            'plugin not found in any plugin repository',
+            'error resolving version for plugin',
+            'authorization failed',
+            '403 forbidden',
+            '401 unauthorized',
         ]
         output_lower = combined_output.lower()
-        has_plugin_error = any(e in output_lower for e in error_indicators)
-        has_compilation_error = any(e in output_lower for e in compilation_error_indicators)
 
+        # If recipes are missing, attempt auto-fix once using Maven suggestions.
+        if 'recipe(s) not found' in output_lower:
+            fixed_recipes = _autofix_recipes_from_output(combined_output, recipes)
+            if fixed_recipes and fixed_recipes != recipes:
+                logger.warning(f"⚠️ OpenRewrite reported missing recipes; retrying with suggested recipe ids")
+                logger.warning(f"   Old recipes: {recipes}")
+                logger.warning(f"   New recipes: {fixed_recipes}")
+                recipes = fixed_recipes
+                # rerun with fixed recipes
+                result = run_cmd(build_cmd())
+                if result is None:
+                    return False
+                logger.info(f"OpenRewrite (fixed recipe) exit code: {result.returncode}")
+                combined_output = (result.stdout or '') + (result.stderr or '')
+                if combined_output.strip():
+                    logger.info(f"OpenRewrite (fixed recipe) output:\n{combined_output.strip()}")
+                output_lower = combined_output.lower()
+
+        has_plugin_error = any(e in output_lower for e in error_indicators)
         if has_plugin_error:
             logger.error(f"❌ OpenRewrite plugin error detected in output — recipe did not run")
             logger.error(f"   Full output above for details")
             return False
 
-        if has_compilation_error and result.returncode != 0:
-            # ── Retry: tell OpenRewrite to skip the compile lifecycle entirely ──
-            # The rewrite-maven-plugin supports running WITHOUT forking the full
-            # Maven lifecycle when invoked with the `rewrite:run` mojo directly.
-            # Adding -Dcheckstyle.skip=true / -Dspotbugs.skip=true removes more
-            # potential blockers.
-            logger.warning("⚠️ Compilation errors detected — retrying with compile/test phases skipped")
-            retry_flags = [
+        # If Maven fails with compilation errors, retry once with more skips.
+        compilation_error_indicators = [
+            'compilation error',
+            'cannot find symbol',
+            'package does not exist',
+        ]
+        has_compilation_error = any(e in output_lower for e in compilation_error_indicators)
+        if has_compilation_error and result.returncode not in (0, 1):
+            logger.warning("⚠️ Compilation errors detected — retrying OpenRewrite with extra skips")
+            retry_cmd = build_cmd([
                 '-Dcheckstyle.skip=true',
                 '-Dspotbugs.skip=true',
                 '-Dpmd.skip=true',
                 '-Dfindbugs.skip=true',
                 '-Denforcer.skip=true',
-                # Tell the rewrite plugin not to run the full lifecycle
-                '-Drewrite.skipMavenParsing=false',
-            ]
-            # Override the goal to use `rewrite:run` (short form) which avoids
-            # the full compile lifecycle that causes the errors.
-            retry_cmd = ['mvn', '--batch-mode']
-            if maven_settings_path:
-                retry_cmd.extend(['-s', maven_settings_path])
-            retry_cmd.extend([
-                '-DskipTests',
-                '-Dmaven.test.skip=true',
-                '-Dmaven.compiler.failOnError=false',
-                '--fail-at-end',
-                '-Dcheckstyle.skip=true',
-                '-Dspotbugs.skip=true',
-                '-Dpmd.skip=true',
-                '-Dfindbugs.skip=true',
-                '-Denforcer.skip=true',
-                '-Dorg.slf4j.simpleLogger.defaultLogLevel=warn',
-                'org.openrewrite.maven:rewrite-maven-plugin:run',
-                f'-Drewrite.recipeArtifactCoordinates={artifacts}',
-                f'-Drewrite.activeRecipes={recipes}',
-                '-Drewrite.dryRun=false',
-                '-Drewrite.failOnDryRunResults=false',
             ])
             logger.info(f"🔄 Retry command: {' '.join(retry_cmd)}")
             retry_result = run_cmd(retry_cmd)
             if retry_result is None:
                 return False
-
             logger.info(f"OpenRewrite retry exit code: {retry_result.returncode}")
             retry_output = (retry_result.stdout or '') + (retry_result.stderr or '')
             if retry_output.strip():
                 logger.info(f"OpenRewrite retry output:\n{retry_output.strip()}")
 
-            combined_output = retry_output
-            output_lower = combined_output.lower()
-            has_plugin_error = any(e in output_lower for e in error_indicators)
-            if has_plugin_error:
-                logger.error(f"❌ OpenRewrite plugin on retry — recipe did not run")
+            output_lower = retry_output.lower()
+            if any(e in output_lower for e in error_indicators):
+                logger.error("❌ OpenRewrite plugin error detected on retry — recipe did not run")
                 return False
 
             result = retry_result
 
+        # Accept 0 (changes) and 1 (no changes) as success.
         if result.returncode not in (0, 1):
             logger.warning(f"⚠️ OpenRewrite exited with code {result.returncode} — treating as failure")
             return False
